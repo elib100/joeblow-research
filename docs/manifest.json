@@ -4,9 +4,9 @@
     "name": "reddit_research",
     "package_name_tentative": "reddit_research",
     "purpose": "Personal Reddit research tool. Single user (Eli's developer account). The use case is: search subreddits for important / useful information for an LLM to summarize.",
-    "status": "design v3 + Phase 0 spike v2 written. Reddit API access request SUBMITTED 2026-04-27 via support form (required by Responsible Builder Policy as of Nov 2025 — self-service script-app creation no longer available). Awaiting Reddit's review (target 7 days, often longer). Spike cannot run until credentials are issued.",
+    "status": "design v4. Pivoted from OAuth+PRAW to Reddit's public .json endpoints (verified working 2026-04-27, see docs/json_endpoint_findings.md). MVP no longer depends on Reddit API access approval — spike is runnable now with no credentials. Reddit API access request still pending from 2026-04-27 submission; if granted, OAuth becomes a future upgrade path for higher rate limits / write capability.",
     "version": "0.0.0-pre",
-    "plan_version": 3,
+    "plan_version": 4,
     "host": "warehouse-vm",
     "source_dir": "/home/elib/code/reddit_api/",
     "category": "personal-tool",
@@ -15,10 +15,10 @@
 
   "decisions": [
     { "id": 1, "topic": "language", "choice": "Python 3.11+", "rationale": "Matches existing portfolio on the deploy host." },
-    { "id": 2, "topic": "reddit_client", "choice": "praw", "rationale": "Handles auth, rate-limit backoff, listing pagination, MoreComments expansion. Drop to raw requests against oauth.reddit.com only for endpoints PRAW lacks." },
-    { "id": 3, "topic": "praw_init_flags", "choice": "check_for_updates=False, read_only=True when write flag off", "rationale": "Skip per-invocation PyPI call. Defense-in-depth on writes — PRAW refuses write attempts at client level." },
+    { "id": 2, "topic": "reddit_transport", "choice": "httpx against Reddit's public .json endpoints (no OAuth, no PRAW)", "rationale": "Sidesteps Responsible Builder Policy approval gate (Nov 2025+). Returns same JSON shape as OAuth API. Exposes X-Ratelimit-* headers cleanly (which PRAW hides). Structurally read-only. Verified 2026-04-27 across all needed endpoints (listings, search, threads+comments, /api/morechildren). See docs/json_endpoint_findings.md." },
+    { "id": 3, "topic": "oauth_upgrade_path", "choice": "OAuth + PRAW deferred to future upgrade only — not in MVP", "rationale": "Useful only for higher rate limits or write capability — neither is an MVP requirement. Reddit API access form submitted 2026-04-27; if approved, OAuth becomes a SLOT-IN ADDITION to the .json transport, not a replacement." },
     { "id": 4, "topic": "cache_backend", "choice": "SQLite single file, WAL, busy_timeout=5000, PRAGMA synchronous=NORMAL", "rationale": "Same operational pattern as collector/warehouse on the deploy host. Handles CLI-vs-MCP contention." },
-    { "id": 5, "topic": "auth_flow", "choice": "script app + password grant for MVP", "rationale": "Existing dev app already works this way. Refresh-token is a security upgrade, not a precondition. Re-evaluate if Reddit deprecates script-app/password-grant policy." },
+    { "id": 5, "topic": "auth_flow", "choice": "none for MVP (.json endpoints are unauthenticated)", "rationale": "No client_id/secret/password to manage. Configuration has no secrets. Future OAuth flow is documented in .env.example as commented-out keys for the upgrade path." },
     { "id": 6, "topic": "packaging", "choice": "PEP 621 pyproject.toml, src/ layout, pip install -e . for dev", "rationale": "Modern standard. Required for CLI entry point and future MCP server import." },
     { "id": 7, "topic": "mcp_transport", "choice": "stdio only, accessed remotely via SSH", "rationale": "Eliminates network listener attack surface. Remote access via 'ssh warehouse reddit-mcp'." },
     { "id": 8, "topic": "roadmap", "choice": "core library → CLI → MCP server", "rationale": "CLI provides cheap debug + personal-use surface. MCP is thin glue on top once core is proven." },
@@ -28,7 +28,8 @@
     { "id": 12, "topic": "cache_key_includes_params", "choice": "cache key includes all retrieval params + normalization_version suffix", "rationale": "Without this, get_thread(top=20) cache-poisons get_thread(top=100). Discovered in second panel review." },
     { "id": 13, "topic": "error_caching_split", "choice": "403/404 cached 24h, 5xx never cached", "rationale": "Permanent vs transient. Caching 5xx would poison after one Reddit blip." },
     { "id": 14, "topic": "fullname_validation_in_core", "choice": "validate ^t[1-6]_[a-z0-9]+$ in core, not at MCP boundary", "rationale": "CLI gets the same protection as MCP. Cheap." },
-    { "id": 15, "topic": "rate_limit_observability", "choice": "trust PRAW's internal backoff; expose auth.limits via status command", "rationale": "Per-call header logging was overkill — PRAW handles backoff correctly. status command is enough for operator visibility." }
+    { "id": 15, "topic": "rate_limit_observability", "choice": "read X-Ratelimit-* on every response; back off proactively at <10% remaining; honor 429 Retry-After", "rationale": ".json transport exposes the headers cleanly, which removes the PRAW-hides-them problem. Manual backoff is straightforward when headroom is visible." },
+    { "id": 16, "topic": "expand_comment_endpoint", "choice": "single dedicated call to /r/<sub>/comments/<thread>/_/<comment>.json (depth/limit params)", "rationale": "Cleaner than tracking 'more' markers + /api/morechildren — one HTTP call returns the comment with its full reply subtree in context. Matches MCP-friendly 'follow this comment' semantics." }
   ],
 
   "operations": [
@@ -59,12 +60,13 @@
     },
     {
       "name": "expand_comment",
-      "signature": "expand_comment(comment_fullname, depth=2, limit=20, fresh=False)",
+      "signature": "expand_comment(thread_id, comment_id, depth=2, limit=20, fresh=False)",
       "returns": "CommentTree (one comment + N levels of replies)",
-      "cache_key_template": "comment_subtree:<fullname>:d<depth>:l<limit>:v1",
+      "endpoint": "/r/<sub>/comments/<thread_id>/_/<comment_id>.json",
+      "cache_key_template": "comment_subtree:t3_<thread>:t1_<comment>:d<depth>:l<limit>:v1",
       "ttl_kind": "comment_subtree",
       "caps": { "depth_max": 5, "limit_max": 50 },
-      "notes": "The 'follow promising sub-trees' operation. Aggregate per-workflow budget also applies."
+      "notes": "The 'follow promising sub-trees' operation. Aggregate per-workflow budget also applies. Subreddit is needed for the URL; resolved from a previous get_thread call's response."
     },
     {
       "name": "purge",
@@ -123,8 +125,10 @@
   ],
 
   "rate_limit_caps": {
-    "morechildren_replace_more_limit_default": 10,
+    "morechildren_children_list_max": 10,
     "expand_comment_per_call": { "depth_max": 5, "limit_max": 50 },
+    "headroom_backoff_threshold": "back off proactively when X-Ratelimit-Remaining < 10",
+    "honor_429_retry_after": true,
     "per_workflow_aggregate_budget": {
       "max_api_calls": 50,
       "max_comments_expanded": 500,
@@ -134,20 +138,22 @@
   },
 
   "security": {
-    "secrets_at_rest": ".env mode 0600, cache dir mode 0700, owned by deploy user only",
+    "secrets_at_rest": "none in MVP — .json transport is unauthenticated. Cache dir mode 0700, owned by deploy user only.",
     "tls_bypass_allowed": false,
     "mcp_network_exposure": "none — stdio only, remote access via SSH",
-    "input_validation": "fullname pattern ^t[1-6]_[a-z0-9]+$ enforced in core",
-    "write_safety": "write flag default off, checked at call time. PRAW read_only=True when flag is off (defense in depth). Audit log of writes is post-MVP.",
-    "cross_context_isolation": "personal vs Motroco data: hard isolation by deployment. Separate service users, separate cache.db, separate credentials per use context. Enforced by Unix file permissions. See historian's personal/CLAUDE.md."
+    "input_validation": "fullname pattern ^t[1-6]_[a-z0-9]+$ (or bare [a-z0-9]+) enforced in core before reaching HTTP layer",
+    "write_safety": "structurally impossible through .json transport — no write endpoints exposed. Write-flag plumbing returns only if/when OAuth is added later.",
+    "cross_context_isolation": "personal vs Motroco data: hard isolation by deployment. Separate service users, separate cache.db per use context. Enforced by Unix file permissions. See historian's personal/CLAUDE.md.",
+    "transport_lockout_risk": "Reddit could block unauthenticated .json access at any time without warning. Mitigation: design core/client.py so transport is swappable; OAuth (when granted) is the slot-in replacement."
   },
 
   "deferred_to_v0_2_or_later": [
     "MCP server adapter",
     "preprocessed views (markdown transforms for token savings)",
-    "write capability behind flag",
+    "OAuth + PRAW transport (only adds value if Reddit grants access — for higher rate limits or write capability)",
+    "write capability (depends on OAuth)",
     "audit log for writes",
-    "async (AsyncPRAW)",
+    "async (httpx async client — straightforward to add)",
     "snapshots / delta-over-time research",
     "multi-account",
     "age-aware TTL"
@@ -225,7 +231,9 @@
     { "date": "2026-04-27", "topic": "Spike script panel-reviewed (round 3) + revised", "outcome": "3-model panel found 3 P1 issues + 5 P2: full_payload_size included _reddit back-reference (SNR meaningless), more_comments probe used AskReddit top-all-time (rate-budget unsafe), Path 3 (expand_comment) missing per CLAUDE.md spec, missing read_only=True/timeout=30 on PRAW init, comments.list() flattened the tree (wrong shape vs v0.1 get_thread). All applied: filter underscore-prefixed keys in full_payload_size; pick a 200-3000 comment thread from r/python top/month with replace_more(limit=2); added Path 3 (list+threads+expand_one with marginal-cost framing); read_only=True + timeout=30 on PRAW init (auth probe restructured since user.me() returns None in read_only mode); use s.comments (top-level only) not s.comments.list(); honest tokenizer divergence note (5-15%, up to 20% on code-heavy); documented Path 2/3 first-3 sampling bias." },
     { "date": "2026-04-27", "topic": "Reddit API gated by Responsible Builder Policy", "outcome": "Discovered self-service script-app registration was killed in Nov 2025; all new OAuth apps now require manual pre-approval via support form. Field reports indicate low approval rates for personal/hobby use cases. Decided to (a) submit anyway with personal-research framing (medical info for wife angle), (b) publish source repo at github.com/elib100/joeblow-research for transparency, (c) plan Reddit .json public endpoint as fallback if rejected." },
     { "date": "2026-04-27", "topic": "Spike v2 panel-reviewed (round 4)", "outcome": "Panel blocked: 1 P1 (Path 3 measures pre-loaded data because s.comments.replace_more(limit=0) recurses through full tree, leaving nothing for candidate.replies.replace_more to expand — fix: re-fetch submission fresh in Path 3) + 2 P2 (auth contract: with read_only=True, username/password are inert, decide whether to drop from REQUIRED_ENV; SNR shape mismatch in Paths 2/3: full_payload_size on top-level comment includes its already-loaded replies subtree but signal excludes nested replies). Fixes deferred until Reddit access granted (no point iterating without ability to test)." },
-    { "date": "2026-04-27", "topic": "GitHub repo published + Reddit API access submitted", "outcome": "Pushed initial commit to github.com/elib100/joeblow-research (MIT license, README, full design docs, spike script). Submitted Reddit API access request via support form with personal-research framing. Awaiting Reddit response — target 7 days." }
+    { "date": "2026-04-27", "topic": "GitHub repo published + Reddit API access submitted", "outcome": "Pushed initial commit to github.com/elib100/joeblow-research (MIT license, README, full design docs, spike script). Submitted Reddit API access request via support form with personal-research framing. Awaiting Reddit response — target 7 days." },
+    { "date": "2026-04-27", "topic": ".json transport probed and verified", "outcome": "Tested Reddit's append-.json public endpoints with curl + identifying UA. All needed shapes work (subreddit listing, search-in-sub, search-all, thread + comments, /api/morechildren). Same JSON shape as PRAW. X-Ratelimit-* headers exposed cleanly (~100 calls per 10-min sliding window). 404/403 distinguishable, 403 includes structured `reason` field. Cookieless and stateless. Findings in docs/json_endpoint_findings.md." },
+    { "date": "2026-04-27", "topic": "PIVOT: .json promoted to primary transport", "outcome": "Changed primary transport from OAuth+PRAW to httpx + Reddit .json endpoints. Reasons: (1) eliminates Responsible Builder Policy approval bottleneck, (2) solves panel's previous PRAW-hides-headroom concern, (3) smaller dependency footprint, (4) structurally read-only (no write-flag plumbing needed in MVP), (5) better error data via `reason` field. Trade-offs: write capability and user-context operations require OAuth (deferred to upgrade path); Reddit could block unauthenticated .json at any time (mitigated by swappable transport design). Rewrote CLAUDE.md, README.md, .env.example, requirements-phase0.txt, phase0_spike.py. Operations API stays the same shape; cache layer / caps / key normalization unchanged. Spike is now runnable immediately with no Reddit account setup." }
   ],
 
   "open_questions": [],

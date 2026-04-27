@@ -1,49 +1,46 @@
 # Handoff — reddit_research
 
 **Updated:** 2026-04-27
-**Status:** design v3 + Phase 0 spike v2 written. **Reddit API access request submitted 2026-04-27** via the support form (mandatory under Reddit's Responsible Builder Policy as of Nov 2025 — self-service script-app creation no longer available). Awaiting Reddit's response (target 7 days, often longer).
-
-**Spike cannot run until credentials are issued.** Spike script v2 has 1 P1 + 2 P2 known fixes pending from the round-4 panel review, but iterating on them is pointless until we can test against the live API.
+**Status:** design v4. **Pivoted to Reddit's public `.json` endpoints as primary transport.** Spike is runnable now — no Reddit account, no OAuth, no API approval needed. Reddit API access request still pending (submitted earlier today) but no longer on the critical path.
 
 ## TL;DR
 
-Personal Reddit research tool — a Python library + CLI + (later) MCP server that lets an LLM search subreddits and pull threads/comments efficiently for summarization. Single user (Eli's dev account), deployed on warehouse-vm. Hard isolation from Motroco data.
+Personal Reddit research tool — a Python library + CLI + (later) MCP server that lets an LLM search Reddit and pull threads/comments efficiently for summarization. Single user, deployed on warehouse-vm. Hard isolation from Motroco data.
+
+**Major architectural change today:** moved from OAuth + PRAW (which is gated behind Reddit's Responsible Builder Policy approval, with low approval rates for personal projects) to the unauthenticated `.json` endpoints (which work today, expose rate-limit headers cleanly, and are structurally read-only). OAuth becomes a future upgrade path for higher rate limits / write capability if Reddit ever grants access.
 
 ## Where to look
 
 | What you want | Where it is |
 |---|---|
 | Full design spec, human-readable | [`CLAUDE.md`](CLAUDE.md) |
-| Machine-readable project state (operations, schema, decisions, caps, session log, open questions) | [`docs/manifest.json`](docs/manifest.json) |
-| Reddit API endpoint catalog (all 202 endpoints, scoped) | [`docs/reddit-api-inventory.json`](docs/reddit-api-inventory.json) |
-| Historian entry (cross-portfolio audit) | `/home/elib/code/motroco-document/personal/reddit_research/AUDIT.md` |
+| Machine-readable project state | [`docs/manifest.json`](docs/manifest.json) |
+| Why we picked the `.json` transport | [`docs/json_endpoint_findings.md`](docs/json_endpoint_findings.md) |
+| Reddit OAuth API endpoint catalog (reference for the deferred upgrade path) | [`docs/reddit-api-inventory.json`](docs/reddit-api-inventory.json) |
+| Historian entry | `/home/elib/code/motroco-document/personal/reddit_research/AUDIT.md` |
 | Data-isolation rule (personal vs Motroco) | `/home/elib/code/motroco-document/personal/CLAUDE.md` |
 
-**`manifest.json` is the structured source of truth.** Read it first if you're picking up cold — it has every operation signature, the schema, every decision with rationale, every cap, and the full session decision log. CLAUDE.md is the same content rendered for human reading.
-
-If `CLAUDE.md` and `manifest.json` ever disagree, fix one to match the other. Don't let drift accumulate.
+`manifest.json` is the structured source of truth. CLAUDE.md is the human-readable view of the same content. If they disagree, fix one to match.
 
 ## What's been done
 
-1. Scoped the project (single-user research tool, full Reddit API surface eventually, read-first).
-2. Scraped the Reddit API spec into `docs/reddit-api-inventory.json` — confirmed `read` scope alone covers 44 endpoints including everything in the research path.
+1. Scoped the project (single-user research tool, read-only).
+2. Scraped the Reddit OAuth API spec into `docs/reddit-api-inventory.json` — kept as reference for the deferred OAuth upgrade.
 3. Designed cache + rate-limit + deployment + security model.
-4. Sent design to a 3-model panel (OpenAI Codex + Gemini + Claude Opus 4.6). Round 1 found 3 blockers — resolved in v2. Round 2 found 1 real bug (cache-key/adaptive-retrieval interaction) plus a should-fix list — all applied in v3.
-5. Added project to historian under new `personal/` section (parallel to `projects/` Motroco tree, with hard data isolation).
+4. Sent design through three rounds of multi-model panel review (Codex / Gemini / Opus).
+5. Discovered Reddit's Responsible Builder Policy (Nov 2025) blocks self-service script-app creation. Submitted API access form anyway.
+6. Published source repo at <https://github.com/elib100/joeblow-research>.
+7. **Probed Reddit's `.json` public endpoints — verified working in 2026 across every shape we need.**
+8. **Pivoted primary transport to `.json`** (httpx, no OAuth, no PRAW). Spike rewritten accordingly.
 
-## What's next (Phase 0 spike, ~60–90 min)
+## What's next (Phase 0 spike, ~30 min, runnable now)
 
-Run `phase0_spike.py` — the script implements all four probes:
+The spike script (`phase0_spike.py`) targets the `.json` transport and runs all four probes:
 
-1. Auth check (PRAW pulls one thread, headroom snapshot before/after).
-2. Error mapping (deliberate 404 / 403 / bogus-id calls → captures `prawcore` exception types).
-3. `MoreComments` cap (`replace_more(limit=10)` on a real big thread).
-4. Benchmark queries — 5 realistic queries, two paths each (`list_only`, `list_plus_threads_top20`), with real tokenizer counts (tiktoken cl100k_base) and signal-to-noise ratio per path.
-
-Outputs:
-- `phase0_notes.md` — exception map + things to verify by hand
-- `phase0_benchmarks.md` — human summary
-- `phase0_benchmarks.json` — machine-readable, becomes v0.2 yardstick
+1. Connectivity — UA accepted, headroom headers populated.
+2. Error mapping — 404 / 403 (with structured `reason`) distinguishable.
+3. `MoreComments` cap — `/api/morechildren.json` with capped child list.
+4. Benchmark queries — five realistic queries, three paths each (`list_only`, `list_plus_threads_top20`, `list_plus_threads_plus_expand_one`), with real tokenizer counts and signal-to-noise ratio.
 
 Setup + run:
 
@@ -51,36 +48,25 @@ Setup + run:
 cd /home/elib/code/reddit_api
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements-phase0.txt
-cp .env.example .env && chmod 600 .env
-# Fill REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_PASSWORD into .env
+cp .env.example .env
 python phase0_spike.py
 ```
 
-Run individual probes with `--probe auth|errors|morechildren|benchmarks` if you want to iterate. After running, read `phase0_notes.md` first — it lists what to verify by hand.
+The `.env` only has `REDDIT_USER_AGENT` worth setting (defaults to `reddit-research:0.1 (by /u/joeblowfromidaho)` if unset). No secrets needed.
 
-## Setup before Phase 0 can run
+Outputs: `phase0_notes.md`, `phase0_benchmarks.md`, `phase0_benchmarks.json`. All gitignored.
 
-Three pre-spike blockers were resolved 2026-04-27:
+## What's deferred
 
-- **Username** = `joeblowfromidaho` (in `.env.example` already)
-- **Deploy service user** = `redditmcp` (must be created with `sudo useradd -m -s /bin/bash redditmcp` before first deploy — not needed for Phase 0 dev work)
-- **Credentials location** = two `.env` files; for Phase 0 (dev), populate `/home/elib/code/reddit_api/.env` from `.env.example` (mode 0600, gitignored)
-
-Remaining one-time setup: Eli fills `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_PASSWORD` into the dev `.env` from his Reddit dev app at <https://www.reddit.com/prefs/apps>.
-
-Full resolution log in `manifest.json` → `resolved_questions`. The `open_questions` array is now empty.
-
-## What's deferred (don't build yet)
-
-MCP server adapter, preprocessed views (token-saving markdown transforms), write capability, audit log, async, snapshots, multi-account, age-aware TTL. See `manifest.json` → `deferred_to_v0_2_or_later`.
+MCP server adapter, preprocessed views, OAuth + PRAW transport (only relevant if Reddit grants the API access request), write capability, audit log, async, snapshots, multi-account, age-aware TTL.
 
 ## Operating constraints to respect
 
-- **Don't lose API access.** This is the single hard requirement. Trust PRAW's backoff; respect every cap; never call `replace_more(limit=None)`.
-- **Hard data isolation from Motroco.** If a Motroco project ever needs Reddit data, it deploys a separate install under a different service user with its own cache.db and credentials. Same code, different data. See historian.
+- **Don't trip Reddit's edge rate limiter.** Read every `X-Ratelimit-*` header; back off proactively when `Remaining < 10`. Honor 429 with `Retry-After`.
+- **Hard data isolation from Motroco.** If a Motroco project ever needs Reddit data, it deploys a separate install under a different service user with its own cache.db. Same code, different data. See historian.
 - **No network listener.** MCP transport is stdio only; remote access via SSH.
-- **Write flag default off**, checked at call time, with PRAW `read_only=True` as defense in depth.
+- **Transport is swappable.** If Reddit kills unauthenticated `.json`, swap the client out — OAuth (when granted) is the slot-in replacement.
 
 ## How to update this handoff
 
-Anything that changes design (operations, schema, caps, decisions) → update `manifest.json` in the same commit. Then update CLAUDE.md (human-readable view) and this HANDOFF.md (status + what's next) to match. Three files, one source of truth.
+Anything that changes design (operations, schema, caps, decisions) → update `manifest.json` in the same commit. Then update CLAUDE.md (human-readable) and this HANDOFF.md (status + what's next) to match. Three files, one source of truth.

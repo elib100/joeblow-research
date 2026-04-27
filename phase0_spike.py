@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
-"""Phase 0 spike — verify Reddit API behavior + measure baseline costs.
+"""Phase 0 spike — verify Reddit .json transport behavior + measure baseline costs.
 
-Probes the Reddit API for the four things we need to know before writing the
-library:
+Targets Reddit's public .json endpoints (no auth needed). Probes for the four
+things we need to know before writing the library:
 
-    1. Auth check          — does PRAW authenticate and pull one thread?
-    2. Error mapping       — which prawcore exceptions for 404 / 403 / etc?
-    3. MoreComments cap    — does replace_more(limit=10) behave as expected?
-    4. Benchmarks          — for 5 realistic research queries, measure
-                              per-path API calls / wall time / signal-to-noise
-                              ratio / approximate token count.
+    1. Connectivity        — UA accepted, headroom headers present.
+    2. Error mapping       — 404 / 403 (with structured `reason`) distinguishable.
+    3. MoreComments cap    — /api/morechildren.json with capped child list.
+    4. Benchmarks          — for 5 realistic queries, measure three paths
+                              (list_only, list_plus_threads_top20,
+                              list_plus_threads_plus_expand_one) with API call
+                              count, wall time, signal-to-noise ratio, token count.
 
 Outputs:
-    phase0_notes.md        — free-form observations + exception mapping
-    phase0_benchmarks.md   — human-readable benchmark summary
-    phase0_benchmarks.json — machine-readable, drives v0.2 comparison
+    phase0_notes.md
+    phase0_benchmarks.md
+    phase0_benchmarks.json
 
 Setup:
     cd /home/elib/code/reddit_api
     python3 -m venv venv && source venv/bin/activate
     pip install -r requirements-phase0.txt
-    cp .env.example .env && chmod 600 .env
-    # ... fill REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_PASSWORD into .env
+    cp .env.example .env  # only REDDIT_USER_AGENT matters; defaults are fine
 
 Run:
     python phase0_spike.py            # all four probes
@@ -37,12 +37,12 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 try:
-    import praw
-    import prawcore
+    import httpx
 except ImportError:
-    sys.exit("Missing praw — run: pip install -r requirements-phase0.txt")
+    sys.exit("Missing httpx — run: pip install -r requirements-phase0.txt")
 
 try:
     from dotenv import load_dotenv
@@ -63,210 +63,257 @@ NOTES_PATH = ROOT / "phase0_notes.md"
 BENCH_MD_PATH = ROOT / "phase0_benchmarks.md"
 BENCH_JSON_PATH = ROOT / "phase0_benchmarks.json"
 
-REQUIRED_ENV = [
-    "REDDIT_CLIENT_ID",
-    "REDDIT_CLIENT_SECRET",
-    "REDDIT_USERNAME",
-    "REDDIT_PASSWORD",
-    "REDDIT_USER_AGENT",
-]
+DEFAULT_UA = "reddit-research:0.1 (by /u/joeblowfromidaho)"
 
 
-def load_reddit() -> praw.Reddit:
-    load_dotenv(ROOT / ".env")
-    missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
-    if missing:
-        sys.exit(
-            f"Missing in .env ({ROOT / '.env'}): {', '.join(missing)}\n"
-            f"Copy .env.example to .env and fill in the secret values."
+# ----- HTTP client ----------------------------------------------------------
+
+
+class RedditJSONClient:
+    """Thin httpx wrapper that observes Reddit's rate-limit headers.
+
+    No auth. No PRAW. No write capability — `.json` doesn't expose it. Returns
+    parsed JSON + status code; transport errors raise.
+    """
+
+    BASE = "https://www.reddit.com"
+
+    def __init__(self, user_agent: str, timeout: float = 30.0) -> None:
+        self.client = httpx.Client(
+            base_url=self.BASE,
+            headers={"User-Agent": user_agent},
+            timeout=timeout,
+            follow_redirects=True,
         )
-    # CLAUDE.md decision 3: read_only=True (defense in depth — also switches PRAW
-    # to application-only auth, so user.me() returns None in this mode; that's
-    # expected and the auth probe handles it). timeout=30 prevents hung runs on
-    # network blips. check_for_updates=False skips a per-invocation PyPI call.
-    return praw.Reddit(
-        client_id=os.environ["REDDIT_CLIENT_ID"],
-        client_secret=os.environ["REDDIT_CLIENT_SECRET"],
-        username=os.environ["REDDIT_USERNAME"],
-        password=os.environ["REDDIT_PASSWORD"],
-        user_agent=os.environ["REDDIT_USER_AGENT"],
-        check_for_updates=False,
-        read_only=True,
-        timeout=30,
-    )
+        self.headroom: dict | None = None
+        self.api_call_count = 0
+        self.user_agent = user_agent
+
+    def get(self, path: str, params: dict | None = None) -> tuple[Any, int]:
+        """Issue a GET, observe rate-limit headers, return (parsed_json, status)."""
+        self.api_call_count += 1
+        r = self.client.get(path, params=params)
+
+        used = r.headers.get("x-ratelimit-used")
+        rem = r.headers.get("x-ratelimit-remaining")
+        rst = r.headers.get("x-ratelimit-reset")
+        if used is not None or rem is not None or rst is not None:
+            self.headroom = {
+                "used": float(used) if used is not None else None,
+                "remaining": float(rem) if rem is not None else None,
+                "reset_in_seconds": float(rst) if rst is not None else None,
+            }
+
+        try:
+            body: Any = r.json()
+        except Exception:
+            body = {"_error": "non-json response", "_text": r.text[:500]}
+        return body, r.status_code
+
+    def close(self) -> None:
+        self.client.close()
 
 
-def headroom(reddit: praw.Reddit) -> dict:
-    """Snapshot PRAW's exposed rate-limit headroom."""
-    try:
-        limits = reddit.auth.limits
-        return {
-            "remaining": limits.get("remaining"),
-            "used": limits.get("used"),
-            "reset_timestamp": limits.get("reset_timestamp"),
-        }
-    except Exception as e:
-        return {"error": f"{type(e).__name__}: {e}"}
+# ----- Helpers --------------------------------------------------------------
 
 
 def count_tokens(text: str) -> int:
-    """Approximate token count. cl100k_base is a tight-enough proxy for ratios."""
+    """Approximate token count; cl100k_base for ratios."""
     if _ENC is not None:
         return len(_ENC.encode(text))
     return max(1, len(text) // 4)
 
 
-def submission_signal(s) -> dict:
+def post_signal(d: dict) -> dict:
+    """The fields an LLM actually needs from a post. Drives signal-to-noise."""
     return {
-        "title": s.title,
-        "body": s.selftext or "",
-        "author": str(s.author) if s.author else "[deleted]",
-        "score": s.score,
-        "created_utc": s.created_utc,
-        "num_comments": s.num_comments,
-        "permalink": s.permalink,
+        "title": d.get("title", ""),
+        "body": d.get("selftext", ""),
+        "author": d.get("author", "[deleted]"),
+        "score": d.get("score", 0),
+        "created_utc": d.get("created_utc", 0),
+        "num_comments": d.get("num_comments", 0),
+        "permalink": d.get("permalink", ""),
+        "subreddit": d.get("subreddit", ""),
     }
 
 
-def comment_signal(c) -> dict:
+def comment_signal(d: dict) -> dict:
     return {
-        "body": getattr(c, "body", ""),
-        "author": str(c.author) if getattr(c, "author", None) else "[deleted]",
-        "score": getattr(c, "score", 0),
-        "created_utc": getattr(c, "created_utc", 0),
+        "body": d.get("body", ""),
+        "author": d.get("author", "[deleted]"),
+        "score": d.get("score", 0),
+        "created_utc": d.get("created_utc", 0),
     }
 
 
-def full_payload_size(praw_obj) -> int:
-    """Approximation of the full Reddit API payload size for one PRAW object.
-
-    Filters out PRAW-internal attrs (anything starting with `_`) — most
-    importantly `_reddit`, the back-reference to the Reddit instance, which
-    would serialize via `default=str` to a huge repr and inflate the "full"
-    size 5–50x. After filtering, what's left is approximately the API payload
-    fields PRAW populated by lazy-loading.
-    """
+def full_size(body: Any) -> int:
+    """Honest full payload size — what Reddit actually returned."""
     try:
-        public = {k: v for k, v in praw_obj.__dict__.items() if not k.startswith("_")}
-        return len(json.dumps(public, default=str))
+        return len(json.dumps(body, default=str))
     except Exception:
         return -1
+
+
+def walk_comment_tree(items: list, into: list) -> None:
+    """Recursively collect every Comment dict from a comment-tree listing."""
+    for item in items:
+        kind = item.get("kind")
+        if kind != "t1":
+            continue
+        d = item["data"]
+        into.append(d)
+        replies = d.get("replies")
+        if isinstance(replies, dict):
+            walk_comment_tree(replies.get("data", {}).get("children", []), into)
 
 
 # ----- Probes ---------------------------------------------------------------
 
 
-def probe_auth(reddit: praw.Reddit) -> dict:
-    """Verify auth via a minimal authenticated read.
-
-    With `read_only=True`, PRAW uses application-only auth (client_credentials),
-    so `reddit.user.me()` returns None. We instead use any successful API call
-    as proof of auth, and check that `auth.limits` populates afterward (it's
-    lazy — pre-call snapshot would always be `None`, so we don't bother taking
-    one).
-    """
-    out = {"name": "auth", "ok": False, "details": {}, "errors": []}
-    out["details"]["read_only_mode"] = bool(getattr(reddit, "read_only", False))
+def probe_auth(client: RedditJSONClient) -> dict:
+    """Confirm UA accepted, headroom headers populated, sample fetch succeeds."""
+    out: dict = {"name": "auth", "ok": False, "details": {}, "errors": []}
     try:
-        sub = next(iter(reddit.subreddit("python").hot(limit=1)))
-        _ = (sub.title, sub.score, sub.num_comments, sub.author)
-        out["details"]["sample_thread"] = {
-            "fullname": sub.fullname,
-            "title": sub.title[:80],
-            "num_comments": sub.num_comments,
-        }
-        post_headroom = headroom(reddit)
-        out["details"]["headroom_post"] = post_headroom
-        # The whole point of this probe: confirm PRAW exposes headroom after a real call.
+        body, status = client.get("/r/python/hot.json", {"limit": 1})
+        out["details"]["status"] = status
+        out["details"]["headroom"] = client.headroom
         out["details"]["headroom_populated"] = (
-            isinstance(post_headroom, dict)
-            and post_headroom.get("remaining") is not None
+            client.headroom is not None
+            and client.headroom.get("remaining") is not None
         )
-        out["ok"] = True
-    except prawcore.exceptions.OAuthException as e:
-        out["errors"].append(f"OAuthException: {e}")
+        if status == 200 and isinstance(body, dict) and body.get("kind") == "Listing":
+            out["ok"] = True
+            children = body.get("data", {}).get("children", [])
+            if children:
+                first = children[0]["data"]
+                out["details"]["sample_thread"] = {
+                    "fullname": "t3_" + first.get("id", ""),
+                    "title": first.get("title", "")[:80],
+                    "num_comments": first.get("num_comments"),
+                }
+        else:
+            out["errors"].append(
+                f"unexpected response: status={status}, body type={type(body).__name__}"
+            )
     except Exception as e:
         out["errors"].append(f"{type(e).__module__}.{type(e).__name__}: {e}")
     return out
 
 
-def probe_errors(reddit: praw.Reddit) -> dict:
-    """Map prawcore exception types for 404 / 403 / quarantine / deleted."""
-    out = {"name": "errors", "exceptions_observed": {}, "details": {}}
-
+def probe_errors(client: RedditJSONClient) -> dict:
+    """Map status codes + structured reason fields for known error cases."""
+    out: dict = {"name": "errors", "responses": {}}
     cases = [
         (
             "nonexistent_subreddit",
-            lambda: list(
-                reddit.subreddit("this_does_not_exist_zzzz_99999_qwertyu").hot(limit=1)
-            ),
+            "/r/this_does_not_exist_zzz_qwerty99/hot.json",
+            None,
         ),
-        (
-            "bogus_thread_id",
-            lambda: reddit.submission(id="zzzzzz").title,
-        ),
-        (
-            "bogus_username",
-            lambda: list(reddit.redditor("user_does_not_exist_zzzzzz_99999").submissions.new(limit=1)),
-        ),
+        ("bogus_thread_id", "/comments/zzzzzz.json", None),
+        ("premium_only_sub", "/r/lounge.json", None),
     ]
-
-    for label, action in cases:
+    for label, path, params in cases:
         try:
-            action()
-            out["exceptions_observed"][label] = "no exception (unexpected — note this)"
+            body, status = client.get(path, params)
+            entry: dict = {"status": status}
+            if isinstance(body, dict):
+                entry["body_keys"] = list(body.keys())
+                entry["reason"] = body.get("reason")
+                entry["message"] = body.get("message")
+                entry["error"] = body.get("error")
+            else:
+                entry["body_type"] = type(body).__name__
+            out["responses"][label] = entry
         except Exception as e:
-            out["exceptions_observed"][label] = f"{type(e).__module__}.{type(e).__name__}: {e}"
-
-    out["details"]["headroom_post"] = headroom(reddit)
+            out["responses"][label] = {
+                "transport_error": f"{type(e).__name__}: {e}"
+            }
+    out["headroom_post"] = client.headroom
     return out
 
 
-def probe_more_comments(reddit: praw.Reddit) -> dict:
-    """Verify replace_more cap on a moderately-sized thread.
+def probe_more_comments(client: RedditJSONClient) -> dict:
+    """Verify /api/morechildren.json behavior with a capped child list.
 
-    Picks a thread with 200–3000 comments (avoids AskReddit-top-all-time, which
-    is 50k+ and would burn 10%+ of the daily rate budget on this single probe).
-    Uses limit=2 so worst case is 2 extra /api/morechildren calls, not 10.
+    Picks a thread with 200–3000 comments (avoids the 50k+ AskReddit-top-all-time
+    pitfall). Sends a 10-id child list to constrain rate-budget cost to one call.
     """
-    out = {"name": "more_comments", "details": {}, "errors": []}
+    out: dict = {"name": "more_comments", "details": {}, "errors": []}
     try:
-        # Find a manageably-sized thread by scanning a few hot listings
+        listing, status = client.get("/r/python/top.json", {"limit": 15, "t": "month"})
+        if status != 200:
+            out["errors"].append(f"listing fetch failed: status={status}")
+            return out
+
         candidate = None
-        for s in reddit.subreddit("python").top(time_filter="month", limit=15):
-            if 200 <= s.num_comments <= 3000:
-                candidate = s
+        for c in listing["data"]["children"]:
+            d = c["data"]
+            if 200 <= d.get("num_comments", 0) <= 3000:
+                candidate = d
                 break
         if candidate is None:
             out["errors"].append(
-                "No thread with 200-3000 comments found in r/python top/month — "
-                "fall back: re-run after picking a different sub."
+                "no thread with 200-3000 comments in r/python top/month — try a different sub"
             )
             return out
 
-        pre = headroom(reddit)
+        thread_body, t_status = client.get(
+            f"/comments/{candidate['id']}.json", {"limit": 100}
+        )
+        if t_status != 200:
+            out["errors"].append(f"thread fetch failed: status={t_status}")
+            return out
+
+        more_marker = None
+        for child in thread_body[1]["data"]["children"]:
+            if child["kind"] == "more":
+                more_marker = child["data"]
+                break
+
+        if not more_marker:
+            out["details"]["no_more_marker"] = (
+                "thread had no MoreComments — single fetch returned everything. "
+                "Cap behavior cannot be exercised; pick a busier thread next time."
+            )
+            return out
+
+        children_to_request = more_marker["children"][:10]
+        link_id = "t3_" + candidate["id"]
+
         t0 = time.time()
-        candidate.comments.replace_more(limit=2)  # cap at 2 extra calls
+        more_body, m_status = client.get(
+            "/api/morechildren.json",
+            {
+                "api_type": "json",
+                "link_id": link_id,
+                "children": ",".join(children_to_request),
+            },
+        )
         elapsed = time.time() - t0
-        # Count top-level only AND total flattened — both are useful signals.
-        top_level_after = len(list(candidate.comments))
-        total_flattened = len(candidate.comments.list())
+
+        things = []
+        if isinstance(more_body, dict):
+            things = more_body.get("json", {}).get("data", {}).get("things", [])
+
         out["details"] = {
             "thread": {
-                "fullname": candidate.fullname,
-                "subreddit": str(candidate.subreddit),
-                "title": candidate.title[:80],
-                "num_comments_official": candidate.num_comments,
+                "id": candidate["id"],
+                "title": candidate["title"][:80],
+                "num_comments_official": candidate["num_comments"],
             },
-            "top_level_comments_after_replace_more_limit_2": top_level_after,
-            "total_comments_flattened_after_replace_more_limit_2": total_flattened,
+            "more_marker_total_children": len(more_marker["children"]),
+            "more_marker_count_field": more_marker.get("count"),
+            "children_requested": len(children_to_request),
+            "things_returned": len(things),
+            "morechildren_status": m_status,
             "wall_time_seconds": round(elapsed, 2),
-            "headroom_pre": pre,
-            "headroom_post": headroom(reddit),
+            "headroom_post": client.headroom,
             "interpretation": (
-                "If `total_flattened` is much less than `num_comments_official`, "
-                "the cap is working — the gap represents comments that would have "
-                "required additional /api/morechildren calls."
+                "/api/morechildren.json takes a capped child-id list and returns at "
+                "most that many things — one HTTP call regardless of list length. "
+                "If `things_returned` < `children_requested`, some children were "
+                "deleted/removed (expected, not a failure)."
             ),
         }
     except Exception as e:
@@ -313,175 +360,204 @@ BENCHMARK_QUERIES = [
 ]
 
 
-def run_listing(reddit: praw.Reddit, q: dict) -> list:
+def run_listing(client: RedditJSONClient, q: dict) -> tuple[Any, int]:
     if q["kind"] == "search":
-        return list(
-            reddit.subreddit(q["subreddit"]).search(q["query"], limit=q["limit"])
+        return client.get(
+            f"/r/{q['subreddit']}/search.json",
+            {"q": q["query"], "restrict_sr": 1, "sort": "relevance", "limit": q["limit"]},
         )
     if q["kind"] == "search_all":
-        return list(reddit.subreddit("all").search(q["query"], limit=q["limit"]))
+        return client.get(
+            "/search.json",
+            {"q": q["query"], "sort": "relevance", "limit": q["limit"]},
+        )
     if q["kind"] == "listing":
-        sub = reddit.subreddit(q["subreddit"])
-        if q["sort"] == "hot":
-            return list(sub.hot(limit=q["limit"]))
-        if q["sort"] == "new":
-            return list(sub.new(limit=q["limit"]))
-        if q["sort"] == "top":
-            return list(sub.top(time_filter=q.get("time_filter", "all"), limit=q["limit"]))
+        sort = q["sort"]
+        params: dict = {"limit": q["limit"]}
+        if sort == "top":
+            params["t"] = q.get("time_filter", "all")
+        return client.get(f"/r/{q['subreddit']}/{sort}.json", params)
     raise ValueError(f"unknown query kind: {q['kind']}")
 
 
-def probe_benchmarks(reddit: praw.Reddit) -> dict:
-    out = {"name": "benchmarks", "queries": []}
+def probe_benchmarks(client: RedditJSONClient) -> dict:
+    out: dict = {"name": "benchmarks", "queries": []}
 
     for q in BENCHMARK_QUERIES:
-        result = {"query": q, "paths": {}}
+        result: dict = {"query": q, "paths": {}}
 
-        # --- Path 1: list only (search or listing, just the result page) ---
-        path1 = {"name": "list_only"}
-        path1["headroom_pre"] = headroom(reddit)
-        t0 = time.time()
-        listing = []
+        # ---------- Path 1: list_only ----------
+        path1: dict = {"name": "list_only"}
+        path1["headroom_pre"] = client.headroom
+        listing_body: Any = None
+        listing_status = 0
+        listing_children: list = []
         try:
-            listing = run_listing(reddit, q)
-            # Touch fields so __dict__ populates for full_payload_size
-            for s in listing:
-                _ = (s.title, s.score, s.num_comments, s.author, s.selftext)
-            sig_total = sum(len(json.dumps(submission_signal(s))) for s in listing)
-            full_total = sum(full_payload_size(s) for s in listing)
-            path1.update(
-                {
-                    "wall_time_seconds": round(time.time() - t0, 2),
-                    "thread_count": len(listing),
-                    "signal_bytes": sig_total,
-                    "full_bytes": full_total,
-                    "signal_to_noise_ratio": round(sig_total / full_total, 4)
-                    if full_total > 0
-                    else None,
-                    "tokens_signal": count_tokens(
-                        json.dumps([submission_signal(s) for s in listing])
-                    ),
-                }
-            )
+            t0 = time.time()
+            listing_body, listing_status = run_listing(client, q)
+            path1["wall_time_seconds"] = round(time.time() - t0, 2)
+            path1["status"] = listing_status
+            if listing_status == 200 and isinstance(listing_body, dict):
+                listing_children = listing_body.get("data", {}).get("children", [])
+                path1["thread_count"] = len(listing_children)
+                path1["full_bytes"] = full_size(listing_body)
+                path1["signal_bytes"] = sum(
+                    len(json.dumps(post_signal(c["data"]))) for c in listing_children
+                )
+                path1["signal_to_noise_ratio"] = (
+                    round(path1["signal_bytes"] / path1["full_bytes"], 4)
+                    if path1["full_bytes"] > 0
+                    else None
+                )
+                sig_text = json.dumps(
+                    [post_signal(c["data"]) for c in listing_children]
+                )
+                path1["tokens_signal"] = count_tokens(sig_text)
+            else:
+                path1["error"] = f"non-200 status: {listing_status}"
         except Exception as e:
             path1["error"] = f"{type(e).__module__}.{type(e).__name__}: {e}"
-        path1["headroom_post"] = headroom(reddit)
+        path1["headroom_post"] = client.headroom
         result["paths"]["list_only"] = path1
 
-        # --- Path 2: list + get_thread for first 3 (top 20 *top-level* comments each) ---
-        # Bias note: sampling first-3 of N favors highest-ranked items. For the SNR
-        # ratio (per-thread JSON shape) this is fine; for absolute volume estimates
-        # it's biased. Documented in phase0_notes.md.
-        path2 = {"name": "list_plus_threads_top20", "_sampling_note": "first 3 of listing"}
-        path2["headroom_pre"] = headroom(reddit)
-        threads = []  # used by Path 3 too
-        if not listing:
-            path2["error"] = "no listing — see list_only error"
+        # ---------- Path 2: list_plus_threads_top20 ----------
+        # Sample first 3 of N to limit rate-budget cost. Per-thread JSON shape is
+        # consistent across rank, so SNR ratio is stable; absolute volume is biased.
+        path2: dict = {
+            "name": "list_plus_threads_top20",
+            "_sampling_note": "first 3 of listing",
+        }
+        path2["headroom_pre"] = client.headroom
+        threads: list = []  # passed to Path 3
+        if not listing_children:
+            path2["error"] = "no listing — see list_only"
         else:
             try:
                 t0 = time.time()
-                for s in listing[:3]:
-                    s.comments.replace_more(limit=0)  # remove MoreComments, no expansion
-                    # IMPORTANT: iterate s.comments (top-level only), NOT
-                    # s.comments.list() which flattens to all depths and would
-                    # include nested replies — wrong shape vs what
-                    # get_thread(top_n_comments=20) will return in v0.1.
-                    top_level = [c for c in s.comments if hasattr(c, "score")]
-                    top_comments = sorted(top_level, key=lambda c: c.score, reverse=True)[:20]
-                    for c in top_comments:
-                        _ = (c.body, c.score, c.author, c.created_utc)
-                    threads.append({"submission": s, "comments": top_comments})
+                full_total = 0
+                for c in listing_children[:3]:
+                    pid = c["data"]["id"]
+                    t_body, t_status = client.get(
+                        f"/comments/{pid}.json", {"limit": 20}
+                    )
+                    if t_status != 200 or not isinstance(t_body, list) or len(t_body) < 2:
+                        continue
+                    full_total += full_size(t_body)
+                    post_data = t_body[0]["data"]["children"][0]["data"]
+                    top_level = [
+                        cc["data"]
+                        for cc in t_body[1]["data"]["children"]
+                        if cc.get("kind") == "t1"
+                    ]
+                    top_20 = sorted(
+                        top_level, key=lambda d: d.get("score", 0), reverse=True
+                    )[:20]
+                    threads.append({"post": post_data, "comments": top_20})
 
-                sig = sum(
-                    len(json.dumps(submission_signal(t["submission"])))
+                path2["wall_time_seconds"] = round(time.time() - t0, 2)
+                path2["threads_pulled"] = len(threads)
+                path2["comments_total"] = sum(len(t["comments"]) for t in threads)
+                path2["full_bytes"] = full_total
+                path2["signal_bytes"] = sum(
+                    len(json.dumps(post_signal(t["post"])))
                     + sum(len(json.dumps(comment_signal(c))) for c in t["comments"])
                     for t in threads
                 )
-                full = sum(
-                    full_payload_size(t["submission"])
-                    + sum(full_payload_size(c) for c in t["comments"])
-                    for t in threads
+                path2["signal_to_noise_ratio"] = (
+                    round(path2["signal_bytes"] / path2["full_bytes"], 4)
+                    if path2["full_bytes"] > 0
+                    else None
                 )
                 sig_text = json.dumps(
                     [
                         {
-                            **submission_signal(t["submission"]),
+                            **post_signal(t["post"]),
                             "comments": [comment_signal(c) for c in t["comments"]],
                         }
                         for t in threads
                     ]
                 )
-                path2.update(
-                    {
-                        "wall_time_seconds": round(time.time() - t0, 2),
-                        "threads_pulled": len(threads),
-                        "comments_total": sum(len(t["comments"]) for t in threads),
-                        "signal_bytes": sig,
-                        "full_bytes": full,
-                        "signal_to_noise_ratio": round(sig / full, 4)
-                        if full > 0
-                        else None,
-                        "tokens_signal": count_tokens(sig_text),
-                    }
-                )
+                path2["tokens_signal"] = count_tokens(sig_text)
             except Exception as e:
                 path2["error"] = f"{type(e).__module__}.{type(e).__name__}: {e}"
-        path2["headroom_post"] = headroom(reddit)
+        path2["headroom_post"] = client.headroom
         result["paths"]["list_plus_threads_top20"] = path2
 
-        # --- Path 3: Path 2 + expand_comment on highest-scored top-level comment with replies ---
-        # Models the LLM's adaptive workflow: see top comments, follow one promising
-        # sub-tree. Per CLAUDE.md Phase 0 step 4 — measures the marginal cost of the
-        # adaptive step.
-        path3 = {"name": "list_plus_threads_plus_expand_one", "_sampling_note": "expand 1 top-level comment per thread, depth=1"}
-        path3["headroom_pre"] = headroom(reddit)
+        # ---------- Path 3: list_plus_threads_plus_expand_one ----------
+        # For each Path 2 thread, pick the highest-scored top-level comment with
+        # a 'replies' subtree (more potential value to expand) and fetch it via
+        # /r/<sub>/comments/<thread>/_/<comment>.json — single dedicated call,
+        # returns the comment with its full reply tree in context.
+        # Marginal bytes/tokens = the additional payload from this expand step.
+        path3: dict = {
+            "name": "list_plus_threads_plus_expand_one",
+            "_sampling_note": "highest-scored top-level comment per thread, single expand call",
+        }
+        path3["headroom_pre"] = client.headroom
         if not threads:
-            path3["error"] = "no threads — see list_plus_threads_top20 error"
+            path3["error"] = "no threads — see list_plus_threads_top20"
         else:
             try:
                 t0 = time.time()
-                expansions = []  # list of (parent_comment, [reply_comments])
+                expansions: list = []
+                marginal_full = 0
+                marginal_signal = 0
+                marginal_text_parts: list = []
                 for t in threads:
-                    candidate = next(
-                        (c for c in t["comments"] if getattr(c, "replies", None)
-                         and len(list(c.replies)) > 0),
-                        None,
-                    )
-                    if candidate is None:
+                    if not t["comments"]:
                         continue
-                    candidate.replies.replace_more(limit=1)  # one extra call max
-                    reply_top_level = [r for r in candidate.replies if hasattr(r, "score")]
-                    for r in reply_top_level:
-                        _ = (r.body, r.score, r.author, r.created_utc)
-                    expansions.append((candidate, reply_top_level))
+                    candidate = t["comments"][0]
+                    comment_id = candidate["id"]
+                    thread_id = t["post"]["id"]
+                    sub = t["post"]["subreddit"]
+                    exp_body, exp_status = client.get(
+                        f"/r/{sub}/comments/{thread_id}/_/{comment_id}.json",
+                        {"limit": 20, "depth": 5},
+                    )
+                    if exp_status != 200 or not isinstance(exp_body, list) or len(exp_body) < 2:
+                        continue
+                    subtree: list = []
+                    walk_comment_tree(
+                        exp_body[1]["data"]["children"], subtree
+                    )
+                    exp_full = full_size(exp_body)
+                    exp_signal = sum(
+                        len(json.dumps(comment_signal(c))) for c in subtree
+                    )
+                    marginal_full += exp_full
+                    marginal_signal += exp_signal
+                    marginal_text_parts.append(
+                        json.dumps([comment_signal(c) for c in subtree])
+                    )
+                    expansions.append(
+                        {
+                            "thread_id": thread_id,
+                            "comment_id": comment_id,
+                            "subtree_comments_total": len(subtree),
+                            "subtree_full_bytes": exp_full,
+                            "subtree_signal_bytes": exp_signal,
+                        }
+                    )
 
-                # Marginal cost: bytes/tokens of just the new replies on top of Path 2
-                marginal_sig = sum(
-                    sum(len(json.dumps(comment_signal(r))) for r in replies)
-                    for _, replies in expansions
+                path3["wall_time_seconds"] = round(time.time() - t0, 2)
+                path3["threads_expanded"] = len(expansions)
+                path3["total_subtree_comments"] = sum(
+                    e["subtree_comments_total"] for e in expansions
                 )
-                marginal_full = sum(
-                    sum(full_payload_size(r) for r in replies)
-                    for _, replies in expansions
+                path3["marginal_full_bytes"] = marginal_full
+                path3["marginal_signal_bytes"] = marginal_signal
+                path3["marginal_signal_to_noise_ratio"] = (
+                    round(marginal_signal / marginal_full, 4)
+                    if marginal_full > 0
+                    else None
                 )
-                marginal_text = json.dumps(
-                    [[comment_signal(r) for r in replies] for _, replies in expansions]
+                path3["marginal_tokens_signal"] = count_tokens(
+                    "[" + ",".join(marginal_text_parts) + "]"
                 )
-                path3.update(
-                    {
-                        "wall_time_seconds": round(time.time() - t0, 2),
-                        "threads_expanded": len(expansions),
-                        "replies_pulled": sum(len(r) for _, r in expansions),
-                        "marginal_signal_bytes": marginal_sig,
-                        "marginal_full_bytes": marginal_full,
-                        "marginal_signal_to_noise_ratio": round(marginal_sig / marginal_full, 4)
-                        if marginal_full > 0 else None,
-                        "marginal_tokens_signal": count_tokens(marginal_text),
-                    }
-                )
+                path3["expansions"] = expansions
             except Exception as e:
                 path3["error"] = f"{type(e).__module__}.{type(e).__name__}: {e}"
-        path3["headroom_post"] = headroom(reddit)
+        path3["headroom_post"] = client.headroom
         result["paths"]["list_plus_threads_plus_expand_one"] = path3
 
         out["queries"].append(result)
@@ -492,17 +568,19 @@ def probe_benchmarks(reddit: praw.Reddit) -> dict:
 # ----- Output ---------------------------------------------------------------
 
 
-def write_outputs(probes: list[dict]) -> None:
+def write_outputs(probes: list[dict], client: RedditJSONClient) -> None:
     summary = {
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "tokenizer": TOKENIZER,
         "tokenizer_note": (
             "tiktoken cl100k_base is an approximation of Anthropic's tokenizer. "
             "Difference is typically 5-15% (worse on code-heavy content, up to ~20%). "
-            "Ratios across queries are stable; absolute counts are advisory. "
-            "Use Anthropic's messages.count_tokens API later to verify if absolute "
-            "numbers drive a v0.2 budget decision."
+            "Ratios across queries are stable; absolute counts are advisory."
         ),
+        "transport": "Reddit .json (unauthenticated)",
+        "user_agent": client.user_agent,
+        "total_api_calls": client.api_call_count,
+        "final_headroom": client.headroom,
         "probes": probes,
     }
     BENCH_JSON_PATH.write_text(json.dumps(summary, indent=2, default=str))
@@ -512,7 +590,10 @@ def write_outputs(probes: list[dict]) -> None:
         "# Phase 0 Benchmarks",
         "",
         f"- Fetched: {summary['fetched_at']}",
+        f"- Transport: {summary['transport']}",
         f"- Tokenizer: {TOKENIZER}",
+        f"- Total HTTP calls this run: {summary['total_api_calls']}",
+        f"- Final rate-limit headroom: {summary['final_headroom']}",
         "",
     ]
     for p in probes:
@@ -527,14 +608,14 @@ def write_outputs(probes: list[dict]) -> None:
                 for path_name, path in q.get("paths", {}).items():
                     if "error" in path:
                         md.append(f"- **{path_name}**: ERROR — {path['error']}")
-                    elif "marginal_signal_bytes" in path:
-                        # Path 3: marginal-cost framing
+                        continue
+                    if "marginal_signal_bytes" in path:
                         ratio = path.get("marginal_signal_to_noise_ratio")
                         ratio_str = f"{ratio:.1%}" if ratio is not None else "?"
                         md.append(
                             f"- **{path_name}** (marginal): "
-                            f"{path.get('threads_expanded', '?')} expanded"
-                            + f" · {path.get('replies_pulled', 0)} replies"
+                            f"{path.get('threads_expanded', '?')} expansions"
+                            + f" · {path.get('total_subtree_comments', 0)} subtree comments"
                             + f" · {path.get('wall_time_seconds')}s"
                             + f" · signal {path.get('marginal_signal_bytes', 0):,}B"
                             + f" / full {path.get('marginal_full_bytes', 0):,}B"
@@ -542,23 +623,21 @@ def write_outputs(probes: list[dict]) -> None:
                             + f" · ~{path.get('marginal_tokens_signal', 0):,} signal tokens"
                         )
                         continue
-                    else:
-                        ratio = path.get("signal_to_noise_ratio")
-                        ratio_str = f"{ratio:.1%}" if ratio is not None else "?"
-                        md.append(
-                            f"- **{path_name}**: "
-                            f"{path.get('thread_count', path.get('threads_pulled', '?'))} threads"
-                            + (
-                                f" · {path['comments_total']} comments"
-                                if "comments_total" in path
-                                else ""
-                            )
-                            + f" · {path.get('wall_time_seconds')}s"
-                            + f" · signal {path.get('signal_bytes', 0):,}B"
-                            + f" / full {path.get('full_bytes', 0):,}B"
-                            + f" · ratio {ratio_str}"
-                            + f" · ~{path.get('tokens_signal', 0):,} signal tokens"
-                        )
+                    ratio = path.get("signal_to_noise_ratio")
+                    ratio_str = f"{ratio:.1%}" if ratio is not None else "?"
+                    extras = ""
+                    if "comments_total" in path:
+                        extras = f" · {path['comments_total']} comments"
+                    md.append(
+                        f"- **{path_name}**: "
+                        f"{path.get('thread_count', path.get('threads_pulled', '?'))} threads"
+                        + extras
+                        + f" · {path.get('wall_time_seconds')}s"
+                        + f" · signal {path.get('signal_bytes', 0):,}B"
+                        + f" / full {path.get('full_bytes', 0):,}B"
+                        + f" · ratio {ratio_str}"
+                        + f" · ~{path.get('tokens_signal', 0):,} signal tokens"
+                    )
                 md.append("")
         else:
             md.append("```json")
@@ -567,47 +646,42 @@ def write_outputs(probes: list[dict]) -> None:
             md.append("")
     BENCH_MD_PATH.write_text("\n".join(md))
 
-    # Notes — anomalies + the key things to write down
+    # Notes — anomalies + things to verify by hand
     notes = [
         "# Phase 0 Notes",
         "",
-        f"Spike: {summary['fetched_at']}",
+        f"Spike: {summary['fetched_at']}  ·  {summary['total_api_calls']} HTTP calls total",
         "",
         "## What to verify by hand against this run",
         "",
         "1. **Auth probe** should show `ok: True` and `headroom_populated: true`. "
-        "If `headroom_populated: false`, PRAW isn't exposing rate-limit headroom "
-        "on this auth flow — the `status` command's headroom display won't work, "
-        "and we'd need to add a request-layer hook. (Note: with `read_only=True`, "
-        "`reddit.user.me()` returns None — that's expected, not a failure.)",
-        "2. **Errors probe** should map each label (`nonexistent_subreddit`, "
-        "`bogus_thread_id`, `bogus_username`) to a distinct `prawcore` exception "
-        "type (NotFound, Redirect, Forbidden, etc.). Lock those into a future "
-        "`core/errors.py` mapping.",
-        "3. **MoreComments probe** — `total_comments_flattened_after_replace_more_limit_2` "
-        "should be much less than `num_comments_official`. If they're equal, the cap "
-        "isn't doing what we think.",
-        "4. **Benchmarks** — note the **signal-to-noise ratio** per path. That's the "
+        "If `headroom_populated: false`, Reddit isn't returning the X-Ratelimit-* "
+        "headers via this transport — the rate-limit observability assumption falls "
+        "apart and we'd need to fall back to fixed-rate pacing.",
+        "2. **Errors probe** should map each label to a distinguishable status + "
+        "structured `reason` field (especially for 403). Lock those into a future "
+        "`core/errors.py` exception map.",
+        "3. **MoreComments probe** — if `things_returned` < `children_requested`, "
+        "that's expected (deleted/removed comments). What we're verifying is that "
+        "the call costs ONE HTTP request regardless of child-list length.",
+        "4. **Benchmarks** — note **signal-to-noise ratio** per path. That's the "
         "ceiling for v0.2 markdown-preprocessor token savings. If already >50%, "
         "preprocessing won't help much; if <25%, preprocessing is the highest-leverage "
-        "v0.2 change. **Path 3's `marginal_signal_to_noise_ratio`** captures the same "
-        "for the adaptive expand-comment step in isolation.",
+        "v0.2 change. Path 3's `marginal_signal_to_noise_ratio` measures the same for "
+        "the adaptive expand-comment step in isolation.",
         "",
         "## Known measurement caveats",
         "",
         "- **Path 2 + 3 sample only the first 3 of N listing items** to limit rate "
-        "budget. This biases absolute volumes toward highest-ranked items but the "
-        "per-thread JSON shape is consistent across rank, so the SNR ratio is "
-        "stable. If absolute volume matters, expand sample size in a follow-up run.",
+        "budget. Per-thread JSON shape is consistent across rank, so the SNR ratio "
+        "is stable; absolute volume estimates are biased toward highest-ranked items.",
         "- **Tokenizer is tiktoken cl100k_base** (OpenAI). Anthropic's tokenizer is "
-        "5–15% different (up to ~20% on code-heavy content). Ratios across queries "
+        "5-15% different (up to ~20% on code-heavy content). Ratios across queries "
         "are stable; absolute token counts are advisory.",
-        "- **`full_payload_size` filters PRAW internals** (anything starting with `_`) "
-        "to avoid the `_reddit` back-reference inflating sizes 5–50x. What's left is "
-        "approximately the API payload PRAW lazy-loaded — directionally correct for "
-        "ratios, not byte-exact.",
+        "- **`full_bytes` is the actual JSON response size** Reddit returned — no "
+        "object-graph noise from a wrapper library, so SNR ratios are trustworthy.",
         "",
-        "## Probe results (errors only — see phase0_benchmarks.{md,json} for the rest)",
+        "## Probe results (errors only — see phase0_benchmarks.{md,json} for benchmarks)",
         "",
     ]
     for p in probes:
@@ -618,8 +692,8 @@ def write_outputs(probes: list[dict]) -> None:
             notes.append("")
         if p["name"] == "errors":
             notes.append("### Exception map (lock into `core/errors.py`)")
-            for label, exc in p.get("exceptions_observed", {}).items():
-                notes.append(f"- **{label}**: `{exc}`")
+            for label, info in p.get("responses", {}).items():
+                notes.append(f"- **{label}**: {json.dumps(info)}")
             notes.append("")
     NOTES_PATH.write_text("\n".join(notes))
 
@@ -636,24 +710,29 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    print(f"reddit_research Phase 0 spike  ·  tokenizer: {TOKENIZER}")
-    reddit = load_reddit()
-    print(f"  authenticated user: {os.environ['REDDIT_USERNAME']}")
-    print(f"  user-agent: {os.environ['REDDIT_USER_AGENT']}")
+    load_dotenv(ROOT / ".env")
+    user_agent = os.environ.get("REDDIT_USER_AGENT", DEFAULT_UA)
+    client = RedditJSONClient(user_agent=user_agent)
 
-    probes = []
+    print(f"reddit_research Phase 0 spike  ·  transport: .json  ·  tokenizer: {TOKENIZER}")
+    print(f"  user-agent: {user_agent}")
+
+    probes: list[dict] = []
     runners = [
         ("auth", probe_auth),
         ("errors", probe_errors),
         ("morechildren", probe_more_comments),
         ("benchmarks", probe_benchmarks),
     ]
-    for i, (name, fn) in enumerate(runners, start=1):
-        if args.probe in ("all", name):
-            print(f"\n[{i}/{len(runners)}] {name}...")
-            probes.append(fn(reddit))
+    try:
+        for i, (name, fn) in enumerate(runners, start=1):
+            if args.probe in ("all", name):
+                print(f"\n[{i}/{len(runners)}] {name}...")
+                probes.append(fn(client))
+    finally:
+        client.close()
 
-    write_outputs(probes)
+    write_outputs(probes, client)
     print(
         f"\nWrote: {NOTES_PATH.name}, {BENCH_MD_PATH.name}, {BENCH_JSON_PATH.name}"
     )
@@ -666,6 +745,8 @@ def main() -> None:
             print(f"  {p['name']}: ok={p['ok']}")
         else:
             print(f"  {p['name']}: see outputs")
+    print(f"  total HTTP calls: {client.api_call_count}")
+    print(f"  final headroom: {client.headroom}")
 
 
 if __name__ == "__main__":
