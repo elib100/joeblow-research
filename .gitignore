@@ -1,0 +1,43 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# Project-local Claude Code config (not part of the project)
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
+.venv/
+venv/
+env/
+
+# Test/cache artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Phase 0 / dev artifacts (capture them for analysis but don't commit)
+phase0_notes.md
+phase0_benchmarks.md
+phase0_benchmarks.json
+*.log
+
+# Local SQLite (dev cache; runtime cache is on warehouse-vm under /home/redditmcp/)
+*.db
+*.db-wal
+*.db-shm
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~

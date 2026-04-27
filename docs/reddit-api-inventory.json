@@ -1,0 +1,1547 @@
+{
+  "fetched_at": "2026-04-27",
+  "source_url": "https://www.reddit.com/dev/api/",
+  "section_count": 19,
+  "endpoint_count": 202,
+  "sections": [
+    {
+      "name": "account",
+      "endpoints": [
+        {
+          "verb": "GET",
+          "path": "/api/v1/me",
+          "scopes": [
+            "identity"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/v1/me/karma",
+          "scopes": [
+            "mysubreddits"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/v1/me/prefs",
+          "scopes": [
+            "identity"
+          ]
+        },
+        {
+          "verb": "PATCH",
+          "path": "/api/v1/me/prefs",
+          "scopes": [
+            "account"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/v1/me/trophies",
+          "scopes": [
+            "identity"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/prefs/",
+          "scopes": [
+            "read"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "announcements",
+      "endpoints": [
+        {
+          "verb": "GET",
+          "path": "/api/announcements/v1",
+          "scopes": [
+            "announcements"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/announcements/v1/hide",
+          "scopes": [
+            "announcements"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/announcements/v1/read",
+          "scopes": [
+            "announcements"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/announcements/v1/read_all",
+          "scopes": [
+            "announcements"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "captcha",
+      "endpoints": [
+        {
+          "verb": "GET",
+          "path": "/api/needs_captcha",
+          "scopes": [
+            "any"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "emoji",
+      "endpoints": [
+        {
+          "verb": "POST",
+          "path": "/api/v1/",
+          "scopes": [
+            "structuredstyles"
+          ]
+        },
+        {
+          "verb": "DELETE",
+          "path": "/api/v1/",
+          "scopes": [
+            "structuredstyles"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/v1/",
+          "scopes": [
+            "structuredstyles"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/v1/",
+          "scopes": [
+            "structuredstyles"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/v1/",
+          "scopes": [
+            "read"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "flair",
+      "endpoints": [
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "modflair"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "modflair"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "modflair"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "modflair"
+          ]
+        },
+        {
+          "verb": "PATCH",
+          "path": "[/r/",
+          "scopes": [
+            "modflair"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "modflair"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "modflair"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "modflair"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "flair"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "modflair"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "modflair"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "flair"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "flair"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "flair"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "flair"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "flair"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "flair"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "links & comments",
+      "endpoints": [
+        {
+          "verb": "POST",
+          "path": "/api/comment",
+          "scopes": [
+            "any"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/del",
+          "scopes": [
+            "edit"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/editusertext",
+          "scopes": [
+            "edit"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/follow_post",
+          "scopes": [
+            "subscribe"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/hide",
+          "scopes": [
+            "report"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/lock",
+          "scopes": [
+            "modposts"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/marknsfw",
+          "scopes": [
+            "modposts"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/morechildren",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/report",
+          "scopes": [
+            "report"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/save",
+          "scopes": [
+            "save"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/saved_categories",
+          "scopes": [
+            "save"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/sendreplies",
+          "scopes": [
+            "edit"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/set_contest_mode",
+          "scopes": [
+            "modposts"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/set_subreddit_sticky",
+          "scopes": [
+            "modposts"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/set_suggested_sort",
+          "scopes": [
+            "modposts"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/spoiler",
+          "scopes": [
+            "modposts"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/store_visits",
+          "scopes": [
+            "save"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/submit",
+          "scopes": [
+            "submit"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/unhide",
+          "scopes": [
+            "report"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/unlock",
+          "scopes": [
+            "modposts"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/unmarknsfw",
+          "scopes": [
+            "modposts"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/unsave",
+          "scopes": [
+            "save"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/unspoiler",
+          "scopes": [
+            "modposts"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/vote",
+          "scopes": [
+            "vote"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "listings",
+      "endpoints": [
+        {
+          "verb": "GET",
+          "path": "/best",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/by_id/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/duplicates/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "read"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "live threads",
+      "endpoints": [
+        {
+          "verb": "GET",
+          "path": "/api/live/by_id/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/live/create",
+          "scopes": [
+            "submit"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/live/happening_now",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/live/",
+          "scopes": [
+            "livemanage"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/live/",
+          "scopes": [
+            "livemanage"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/live/",
+          "scopes": [
+            "edit"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/live/",
+          "scopes": [
+            "livemanage"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/live/",
+          "scopes": [
+            "livemanage"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/live/",
+          "scopes": [
+            "livemanage"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/live/",
+          "scopes": [
+            "livemanage"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/live/",
+          "scopes": [
+            "report"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/live/",
+          "scopes": [
+            "livemanage"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/live/",
+          "scopes": [
+            "livemanage"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/live/",
+          "scopes": [
+            "livemanage"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/live/",
+          "scopes": [
+            "edit"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/live/",
+          "scopes": [
+            "livemanage"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/live/",
+          "scopes": [
+            "submit"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/live/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/live/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/live/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/live/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/live/",
+          "scopes": [
+            "read"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "private messages",
+      "endpoints": [
+        {
+          "verb": "POST",
+          "path": "/api/compose",
+          "scopes": [
+            "privatemessages"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/del_msg",
+          "scopes": [
+            "privatemessages"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/read_all_messages",
+          "scopes": [
+            "privatemessages"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/read_message",
+          "scopes": [
+            "privatemessages"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/message/",
+          "scopes": [
+            "privatemessages"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "misc",
+      "endpoints": [
+        {
+          "verb": "GET",
+          "path": "/api/v1/scopes",
+          "scopes": [
+            "any"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "moderation",
+      "endpoints": [
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "modlog"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "modself"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/approve",
+          "scopes": [
+            "modposts"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/distinguish",
+          "scopes": [
+            "modposts"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/ignore_reports",
+          "scopes": [
+            "modposts"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/leavecontributor",
+          "scopes": [
+            "modself"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/leavemoderator",
+          "scopes": [
+            "modself"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/remove",
+          "scopes": [
+            "modposts"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/show_comment",
+          "scopes": [
+            "modposts"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/snooze_reports",
+          "scopes": [
+            "modposts"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/unignore_reports",
+          "scopes": [
+            "modposts"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/unsnooze_reports",
+          "scopes": [
+            "modposts"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/update_crowd_control_level",
+          "scopes": [
+            "modposts"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "modconfig"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "new modmail",
+      "endpoints": [
+        {
+          "verb": "POST",
+          "path": "/api/mod/bulk_read",
+          "scopes": [
+            "modmail"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/mod/conversations",
+          "scopes": [
+            "modmail"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/mod/conversations",
+          "scopes": [
+            "modmail"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/mod/conversations/:conversation_id",
+          "scopes": [
+            "modmail"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/mod/conversations/:conversation_id",
+          "scopes": [
+            "modmail"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/mod/conversations/:conversation_id/approve",
+          "scopes": [
+            "modmail"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/mod/conversations/:conversation_id/archive",
+          "scopes": [
+            "modmail"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/mod/conversations/:conversation_id/disapprove",
+          "scopes": [
+            "modmail"
+          ]
+        },
+        {
+          "verb": "DELETE",
+          "path": "/api/mod/conversations/:conversation_id/highlight",
+          "scopes": [
+            "modmail"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/mod/conversations/:conversation_id/highlight",
+          "scopes": [
+            "modmail"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/mod/conversations/:conversation_id/mute",
+          "scopes": [
+            "modmail"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/mod/conversations/:conversation_id/temp_ban",
+          "scopes": [
+            "modmail"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/mod/conversations/:conversation_id/unarchive",
+          "scopes": [
+            "modmail"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/mod/conversations/:conversation_id/unban",
+          "scopes": [
+            "modmail"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/mod/conversations/:conversation_id/unmute",
+          "scopes": [
+            "modmail"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/mod/conversations/read",
+          "scopes": [
+            "modmail"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/mod/conversations/subreddits",
+          "scopes": [
+            "modmail"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/mod/conversations/unread",
+          "scopes": [
+            "modmail"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/mod/conversations/unread/count",
+          "scopes": [
+            "modmail"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "modnote",
+      "endpoints": [
+        {
+          "verb": "DELETE",
+          "path": "/api/mod/notes",
+          "scopes": [
+            "modnote"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/mod/notes",
+          "scopes": [
+            "modnote"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/mod/notes",
+          "scopes": [
+            "modnote"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/mod/notes/recent",
+          "scopes": [
+            "modnote"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "multis",
+      "endpoints": [
+        {
+          "verb": "POST",
+          "path": "/api/multi/copy",
+          "scopes": [
+            "subscribe"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/multi/mine",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/multi/user/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "DELETE",
+          "path": "/api/multi/",
+          "scopes": [
+            "subscribe"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/multi/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/multi/",
+          "scopes": [
+            "subscribe"
+          ]
+        },
+        {
+          "verb": "PUT",
+          "path": "/api/multi/",
+          "scopes": [
+            "subscribe"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/multi/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "PUT",
+          "path": "/api/multi/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "DELETE",
+          "path": "/api/multi/",
+          "scopes": [
+            "subscribe"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/multi/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "PUT",
+          "path": "/api/multi/",
+          "scopes": [
+            "subscribe"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "search",
+      "endpoints": [
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "read"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "subreddits",
+      "endpoints": [
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "modconfig"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "modconfig"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "modconfig"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "modconfig"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/recommend/sr/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/search_reddit_names",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/search_reddit_names",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/search_subreddits",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/site_admin",
+          "scopes": [
+            "modconfig"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "submit"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/subreddit_autocomplete",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/subreddit_autocomplete_v2",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "modconfig"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/subscribe",
+          "scopes": [
+            "subscribe"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "modconfig"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/v1/",
+          "scopes": [
+            "submit"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/r/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/r/",
+          "scopes": [
+            "modconfig"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/r/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/r/",
+          "scopes": [
+            "modconfig"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/subreddits/mine/",
+          "scopes": [
+            "mysubreddits"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/subreddits/search",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/subreddits/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/users/search",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/users/",
+          "scopes": [
+            "read"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "users",
+      "endpoints": [
+        {
+          "verb": "POST",
+          "path": "/api/block_user",
+          "scopes": [
+            "account"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "any"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "/api/report_user",
+          "scopes": [
+            "report"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "modothers"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "any"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/user_data_by_account_ids",
+          "scopes": [
+            "privatemessages"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/username_available",
+          "scopes": [
+            "any"
+          ]
+        },
+        {
+          "verb": "DELETE",
+          "path": "/api/v1/me/friends/",
+          "scopes": [
+            "subscribe"
+          ]
+        },
+        {
+          "verb": "PUT",
+          "path": "/api/v1/me/friends/",
+          "scopes": [
+            "subscribe"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/api/v1/user/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/user/",
+          "scopes": [
+            "read"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "/user/",
+          "scopes": [
+            "history"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "widgets",
+      "endpoints": [
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "structuredstyles"
+          ]
+        },
+        {
+          "verb": "DELETE",
+          "path": "[/r/",
+          "scopes": [
+            "structuredstyles"
+          ]
+        },
+        {
+          "verb": "PUT",
+          "path": "[/r/",
+          "scopes": [
+            "structuredstyles"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "structuredstyles"
+          ]
+        },
+        {
+          "verb": "PATCH",
+          "path": "[/r/",
+          "scopes": [
+            "structuredstyles"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "structuredstyles"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "wiki",
+      "endpoints": [
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "modwiki"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "wikiedit"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "modwiki"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "modwiki"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "wikiread"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "wikiread"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "wikiread"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "wikiread"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "modwiki"
+          ]
+        },
+        {
+          "verb": "POST",
+          "path": "[/r/",
+          "scopes": [
+            "modwiki"
+          ]
+        },
+        {
+          "verb": "GET",
+          "path": "[/r/",
+          "scopes": [
+            "wikiread"
+          ]
+        }
+      ]
+    }
+  ],
+  "scopes": {
+    "identity": 3,
+    "mysubreddits": 2,
+    "account": 2,
+    "read": 44,
+    "announcements": 4,
+    "any": 6,
+    "structuredstyles": 10,
+    "modflair": 10,
+    "flair": 7,
+    "edit": 5,
+    "subscribe": 10,
+    "report": 5,
+    "modposts": 18,
+    "save": 4,
+    "submit": 5,
+    "vote": 1,
+    "livemanage": 10,
+    "privatemessages": 6,
+    "modlog": 1,
+    "modself": 3,
+    "modconfig": 10,
+    "modmail": 19,
+    "modnote": 4,
+    "modothers": 1,
+    "history": 1,
+    "modwiki": 5,
+    "wikiedit": 1,
+    "wikiread": 5
+  }
+}

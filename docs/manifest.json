@@ -1,0 +1,270 @@
+{
+  "$schema_note": "Machine-readable project state. Source of truth for design; CLAUDE.md is the human-readable view of the same content. When the two disagree, fix one to match the other — don't let drift accumulate.",
+  "project": {
+    "name": "reddit_research",
+    "package_name_tentative": "reddit_research",
+    "purpose": "Personal Reddit research tool. Single user (Eli's developer account). The use case is: search subreddits for important / useful information for an LLM to summarize.",
+    "status": "design v3 (panel-reviewed twice). All Phase-0 blockers resolved. Phase 0 spike script (phase0_spike.py) is ready to run — only remaining step is Eli filling credential values into /home/elib/code/reddit_api/.env, then `python phase0_spike.py`.",
+    "version": "0.0.0-pre",
+    "plan_version": 3,
+    "host": "warehouse-vm",
+    "source_dir": "/home/elib/code/reddit_api/",
+    "category": "personal-tool",
+    "is_motroco": false
+  },
+
+  "decisions": [
+    { "id": 1, "topic": "language", "choice": "Python 3.11+", "rationale": "Matches existing portfolio on the deploy host." },
+    { "id": 2, "topic": "reddit_client", "choice": "praw", "rationale": "Handles auth, rate-limit backoff, listing pagination, MoreComments expansion. Drop to raw requests against oauth.reddit.com only for endpoints PRAW lacks." },
+    { "id": 3, "topic": "praw_init_flags", "choice": "check_for_updates=False, read_only=True when write flag off", "rationale": "Skip per-invocation PyPI call. Defense-in-depth on writes — PRAW refuses write attempts at client level." },
+    { "id": 4, "topic": "cache_backend", "choice": "SQLite single file, WAL, busy_timeout=5000, PRAGMA synchronous=NORMAL", "rationale": "Same operational pattern as collector/warehouse on the deploy host. Handles CLI-vs-MCP contention." },
+    { "id": 5, "topic": "auth_flow", "choice": "script app + password grant for MVP", "rationale": "Existing dev app already works this way. Refresh-token is a security upgrade, not a precondition. Re-evaluate if Reddit deprecates script-app/password-grant policy." },
+    { "id": 6, "topic": "packaging", "choice": "PEP 621 pyproject.toml, src/ layout, pip install -e . for dev", "rationale": "Modern standard. Required for CLI entry point and future MCP server import." },
+    { "id": 7, "topic": "mcp_transport", "choice": "stdio only, accessed remotely via SSH", "rationale": "Eliminates network listener attack surface. Remote access via 'ssh warehouse reddit-mcp'." },
+    { "id": 8, "topic": "roadmap", "choice": "core library → CLI → MCP server", "rationale": "CLI provides cheap debug + personal-use surface. MCP is thin glue on top once core is proven." },
+    { "id": 9, "topic": "caching_default", "choice": "cache by default (opt-out), fresh=True per-call to bypass", "rationale": "LLM shouldn't have to think about caching ergonomics. Fast-by-default is the point." },
+    { "id": 10, "topic": "ttl_strategy", "choice": "three flat TTLs, no age-aware computation", "rationale": "Variable age-aware TTL was overengineered for the 'don't need data for long' research workflow. Add age-awareness later if it proves valuable." },
+    { "id": 11, "topic": "cache_object_form", "choice": "normalized PRAW objects serialized to JSON dict (NOT byte-for-byte raw)", "rationale": "PRAW returns hydrated objects, not raw payloads. Matches actual data flow." },
+    { "id": 12, "topic": "cache_key_includes_params", "choice": "cache key includes all retrieval params + normalization_version suffix", "rationale": "Without this, get_thread(top=20) cache-poisons get_thread(top=100). Discovered in second panel review." },
+    { "id": 13, "topic": "error_caching_split", "choice": "403/404 cached 24h, 5xx never cached", "rationale": "Permanent vs transient. Caching 5xx would poison after one Reddit blip." },
+    { "id": 14, "topic": "fullname_validation_in_core", "choice": "validate ^t[1-6]_[a-z0-9]+$ in core, not at MCP boundary", "rationale": "CLI gets the same protection as MCP. Cheap." },
+    { "id": 15, "topic": "rate_limit_observability", "choice": "trust PRAW's internal backoff; expose auth.limits via status command", "rationale": "Per-call header logging was overkill — PRAW handles backoff correctly. status command is enough for operator visibility." }
+  ],
+
+  "operations": [
+    {
+      "name": "search",
+      "signature": "search(query, subreddit=None, sort='relevance', time='all', limit=25, fresh=False)",
+      "returns": "list[ThreadSummary] (title, score, author, sub, num_comments, permalink, fullname, created_utc)",
+      "cache_key_template": "search:<canonical-json-of-{query,subreddit,sort,time,limit}>",
+      "ttl_kind": "search",
+      "caps": null
+    },
+    {
+      "name": "get_subreddit_listing",
+      "signature": "get_subreddit_listing(name, sort='hot', limit=25, fresh=False)",
+      "returns": "list[ThreadSummary]",
+      "cache_key_template": "listing:<r/name>:<sort>:<limit>",
+      "ttl_kind": "listing",
+      "caps": null
+    },
+    {
+      "name": "get_thread",
+      "signature": "get_thread(fullname, top_n_comments=20, fresh=False)",
+      "returns": "Thread (post + top N top-level comments by score, no sub-tree expansion)",
+      "cache_key_template": "thread:<fullname>:top<N>:v1",
+      "ttl_kind": "thread",
+      "caps": { "top_n_comments_max": 100 },
+      "notes": "Cheap by design. LLM picks promising top-level comments to follow up on."
+    },
+    {
+      "name": "expand_comment",
+      "signature": "expand_comment(comment_fullname, depth=2, limit=20, fresh=False)",
+      "returns": "CommentTree (one comment + N levels of replies)",
+      "cache_key_template": "comment_subtree:<fullname>:d<depth>:l<limit>:v1",
+      "ttl_kind": "comment_subtree",
+      "caps": { "depth_max": 5, "limit_max": 50 },
+      "notes": "The 'follow promising sub-trees' operation. Aggregate per-workflow budget also applies."
+    },
+    {
+      "name": "purge",
+      "signature": "purge(older_than_days=30)",
+      "returns": "int (rows deleted)",
+      "cache_key_template": null,
+      "ttl_kind": null,
+      "caps": null
+    },
+    {
+      "name": "status",
+      "signature": "status()",
+      "returns": "Status (cache_size_bytes, cache_hit_rate, auth_limits, auth_state)",
+      "cache_key_template": null,
+      "ttl_kind": null,
+      "caps": null,
+      "notes": "auth_state is one of: never_exercised, last_call_ok, last_call_failed:<reason> — distinguishes bad credentials from 'we just haven't called yet'."
+    }
+  ],
+
+  "schema": {
+    "version": 1,
+    "tables": [
+      {
+        "name": "meta",
+        "columns": [
+          { "name": "key", "type": "TEXT", "constraints": "PRIMARY KEY" },
+          { "name": "value", "type": "TEXT", "constraints": "NOT NULL" }
+        ],
+        "initial_rows": [{ "key": "schema_version", "value": "1" }]
+      },
+      {
+        "name": "cached_objects",
+        "columns": [
+          { "name": "kind", "type": "TEXT", "constraints": "NOT NULL", "values_enum": ["search", "listing", "thread", "comment_subtree", "error_permanent"] },
+          { "name": "cache_key", "type": "TEXT", "constraints": "NOT NULL", "notes": "includes all retrieval params + normalization_version (e.g. ':v1' suffix)" },
+          { "name": "fetched_at", "type": "INTEGER", "constraints": "NOT NULL", "notes": "unix seconds" },
+          { "name": "status_code", "type": "INTEGER", "constraints": "NOT NULL", "notes": "200 / 403 / 404" },
+          { "name": "body_json", "type": "TEXT", "constraints": "NOT NULL", "notes": "normalized PRAW object dict, or error metadata for non-200" }
+        ],
+        "primary_key": ["kind", "cache_key"]
+      }
+    ],
+    "indices": [
+      { "name": "idx_cached_fetched_at", "table": "cached_objects", "columns": ["fetched_at"] }
+    ],
+    "pragmas": ["journal_mode=WAL", "busy_timeout=5000", "synchronous=NORMAL"]
+  },
+
+  "ttl_table": [
+    { "kind": "search", "ttl_seconds": 900 },
+    { "kind": "listing", "ttl_seconds": 3600 },
+    { "kind": "thread", "ttl_seconds": 86400 },
+    { "kind": "comment_subtree", "ttl_seconds": 86400 },
+    { "kind": "error_permanent", "ttl_seconds": 86400, "notes": "Only 403/404 are cached as errors. 5xx and network errors are never cached." }
+  ],
+
+  "rate_limit_caps": {
+    "morechildren_replace_more_limit_default": 10,
+    "expand_comment_per_call": { "depth_max": 5, "limit_max": 50 },
+    "per_workflow_aggregate_budget": {
+      "max_api_calls": 50,
+      "max_comments_expanded": 500,
+      "scope": "per-process for CLI; per-session for MCP",
+      "on_exceed": "raise BudgetExceeded"
+    }
+  },
+
+  "security": {
+    "secrets_at_rest": ".env mode 0600, cache dir mode 0700, owned by deploy user only",
+    "tls_bypass_allowed": false,
+    "mcp_network_exposure": "none — stdio only, remote access via SSH",
+    "input_validation": "fullname pattern ^t[1-6]_[a-z0-9]+$ enforced in core",
+    "write_safety": "write flag default off, checked at call time. PRAW read_only=True when flag is off (defense in depth). Audit log of writes is post-MVP.",
+    "cross_context_isolation": "personal vs Motroco data: hard isolation by deployment. Separate service users, separate cache.db, separate credentials per use context. Enforced by Unix file permissions. See historian's personal/CLAUDE.md."
+  },
+
+  "deferred_to_v0_2_or_later": [
+    "MCP server adapter",
+    "preprocessed views (markdown transforms for token savings)",
+    "write capability behind flag",
+    "audit log for writes",
+    "async (AsyncPRAW)",
+    "snapshots / delta-over-time research",
+    "multi-account",
+    "age-aware TTL"
+  ],
+
+  "non_goals": [
+    "Multi-user / multi-account",
+    "Web UI",
+    "Real-time stream consumption (live threads, websocket)",
+    "HTML scraping (always use the API)",
+    "Reddit moderation tooling",
+    "Public exposure of the MCP server",
+    "Long-term archival storage / delta-over-time research",
+    "Sharing data between personal and Motroco contexts"
+  ],
+
+  "phase_0_checklist": [
+    { "step": 1, "task": "Auth check: confirm dev app authenticates + pulls one thread via PRAW", "blocking_for_mvp": true },
+    { "step": 2, "task": "Map error behavior: banned/private/deleted thread, observe prawcore exceptions, distinguish 403/404 from 5xx", "blocking_for_mvp": true },
+    { "step": 3, "task": "Verify replace_more(limit=10) on a real big thread", "blocking_for_mvp": true },
+    { "step": 4, "task": "Benchmark queries — 3-5 realistic queries with per-path measurement, real tokenizer counts, signal-to-noise ratio. Save as phase0_benchmarks.md + phase0_benchmarks.json", "blocking_for_mvp": false, "feeds_into": "v0.2 preprocessing design" },
+    { "step": 5, "task": "Cache-hit/miss instrumentation in smoke test for baseline", "blocking_for_mvp": false }
+  ],
+
+  "panel_reviews": [
+    {
+      "round": 1,
+      "date": "2026-04-27",
+      "models": ["Codex (gpt-5.4)", "Gemini", "Claude Opus 4.6"],
+      "blockers_found": 3,
+      "blockers": [
+        "Reddit script-app type can't do refresh-token flow (Opus)",
+        "PRAW hides X-Ratelimit-* headers (Codex + Opus)",
+        "Byte-for-byte raw cache is incompatible with PRAW (Codex)"
+      ],
+      "blockers_resolution": "v2: dropped refresh-token requirement (script+password grant fine for personal/single-user); dropped per-call header observability (trust PRAW backoff, expose auth.limits via status); renamed 'raw cache' to 'normalized PRAW objects'."
+    },
+    {
+      "round": 2,
+      "date": "2026-04-27",
+      "models": ["Codex (gpt-5.4)", "Gemini", "Claude Opus 4.6"],
+      "blockers_found": 1,
+      "blockers": [
+        "Partial-view cache keys must include retrieval params (Codex + Opus, P1) — get_thread(top=20) silently cache-poisons get_thread(top=100)"
+      ],
+      "blockers_resolution": "v3: cache keys now include all retrieval params + normalization_version (':v1' suffix).",
+      "should_fix_applied": [
+        "Per-call caps on expand_comment (depth ≤ 5, limit ≤ 50) + per-workflow aggregate budget",
+        "Don't cache 5xx (only 403/404)",
+        "PRAW read_only=True when write flag off",
+        "fresh=True propagates to nested fetches",
+        "Removed subreddit_about/user_about (unused)",
+        "status() distinguishes auth never_exercised from last_call_ok/failed",
+        "Phase 0 benchmarks: real tokenizer counts + per-path + signal-to-noise ratio",
+        "Validate fullname in core not just MCP boundary",
+        "PRAGMA synchronous=NORMAL explicit",
+        "Documented Reddit-policy-change as hardening trigger"
+      ]
+    }
+  ],
+
+  "session_log": [
+    { "date": "2026-04-26", "topic": "initial scope", "outcome": "Established: full Reddit API surface, read-first for research, write gated. Standalone CLI first; MCP + agents later. Caching opt-in initially." },
+    { "date": "2026-04-26", "topic": "rate-limit discipline", "outcome": "Hard requirement: don't lose API access. Treat rate budget as ceiling. Mandatory UA discipline." },
+    { "date": "2026-04-27", "topic": "API spec parsed", "outcome": "Scraped reddit.com/dev/api into docs/reddit-api-inventory.json: 19 sections, 202 endpoints, 28 OAuth scopes. Read scope alone covers 44 endpoints — enough for the research path." },
+    { "date": "2026-04-27", "topic": "deployment", "outcome": "Confirmed running on warehouse-vm. Deploy under dedicated service user (suggested: redditmcp). Cache + .env under /home/<deploy>/reddit-cache/." },
+    { "date": "2026-04-27", "topic": "cache design", "outcome": "Two-layer cache (raw + preprocessed); preprocessed layer deferred to v0.2. Variable TTL by kind (later simplified to flat 3 TTLs). fresh=True per-call escape hatch." },
+    { "date": "2026-04-27", "topic": "snapshots discussed", "outcome": "Eli wanted optional snapshot capability for delta-over-time research; later confirmed no current use case. Cut from doc; keep architectural room to add later." },
+    { "date": "2026-04-27", "topic": "first panel review", "outcome": "3 blockers found, all resolved in v2 by simplification (script+password grant kept, headroom observability dropped, raw renamed to normalized)." },
+    { "date": "2026-04-27", "topic": "adaptive retrieval added", "outcome": "Added expand_comment as first-class operation. LLM workflow: search → get_thread (cheap, top-N) → expand_comment on promising sub-trees. Saves API calls + tokens." },
+    { "date": "2026-04-27", "topic": "second panel review", "outcome": "1 P1 (cache key bug from adaptive retrieval) + ~10 should-fixes. All applied in v3." },
+    { "date": "2026-04-27", "topic": "historian integration", "outcome": "Project added to motroco-document under new personal/ section (parallel to projects/). Hard data-isolation rule established between personal tools and Motroco projects." },
+    { "date": "2026-04-27", "topic": "Phase 0 blockers resolved", "outcome": "Username = joeblowfromidaho. Deploy user = redditmcp (needs creation). Credentials = two .env files (prod at /home/redditmcp/reddit-cache/.env, dev at /home/elib/code/reddit_api/.env) loaded via python-dotenv. Created .env.example (committed) and .gitignore. Phase 0 unblocked — only remaining setup is Eli filling actual credential values into the dev .env." },
+    { "date": "2026-04-27", "topic": "Phase 0 spike script written", "outcome": "Created phase0_spike.py + requirements-phase0.txt. Runs 4 probes (auth / errors / morechildren / benchmarks). Each benchmark query measures two paths (list_only and list_plus_threads_top20) with signal-to-noise ratio + token counts via tiktoken cl100k_base. Outputs phase0_notes.md, phase0_benchmarks.md, phase0_benchmarks.json (all gitignored). Ready to run." },
+    { "date": "2026-04-27", "topic": "Spike script panel-reviewed (round 3) + revised", "outcome": "3-model panel found 3 P1 issues + 5 P2: full_payload_size included _reddit back-reference (SNR meaningless), more_comments probe used AskReddit top-all-time (rate-budget unsafe), Path 3 (expand_comment) missing per CLAUDE.md spec, missing read_only=True/timeout=30 on PRAW init, comments.list() flattened the tree (wrong shape vs v0.1 get_thread). All applied: filter underscore-prefixed keys in full_payload_size; pick a 200-3000 comment thread from r/python top/month with replace_more(limit=2); added Path 3 (list+threads+expand_one with marginal-cost framing); read_only=True + timeout=30 on PRAW init (auth probe restructured since user.me() returns None in read_only mode); use s.comments (top-level only) not s.comments.list(); honest tokenizer divergence note (5-15%, up to 20% on code-heavy); documented Path 2/3 first-3 sampling bias." }
+  ],
+
+  "open_questions": [],
+
+  "resolved_questions": [
+    {
+      "question": "What username goes in the User-Agent string?",
+      "resolved_at": "2026-04-27",
+      "answer": "joeblowfromidaho",
+      "applied_to": ["CLAUDE.md (Decisions, Rate-limit discipline, Credentials)", ".env.example REDDIT_USERNAME + REDDIT_USER_AGENT"]
+    },
+    {
+      "question": "What's the deploy service user's name?",
+      "resolved_at": "2026-04-27",
+      "answer": "redditmcp (must be created with `sudo useradd -m -s /bin/bash redditmcp` if it doesn't exist yet)",
+      "applied_to": ["CLAUDE.md (Deployment section)", "historian personal/reddit_research/AUDIT.md"]
+    },
+    {
+      "question": "Where do the Reddit dev app credentials live?",
+      "resolved_at": "2026-04-27",
+      "answer": "Two .env files: production at /home/redditmcp/reddit-cache/.env (mode 0600, owned by redditmcp), dev at /home/elib/code/reddit_api/.env (mode 0600, owned by elib, gitignored). Schema template at .env.example (committed, no values). Loaded via python-dotenv. No vault/keystore — file-system perms on this single-user single-machine setup are sufficient.",
+      "applied_to": ["CLAUDE.md (Credentials section)", ".env.example", ".gitignore"]
+    }
+  ],
+
+  "references": {
+    "claude_md": "CLAUDE.md",
+    "handoff": "HANDOFF.md",
+    "api_inventory": "docs/reddit-api-inventory.json",
+    "historian_audit": "/home/elib/code/motroco-document/personal/reddit_research/AUDIT.md",
+    "historian_data_isolation_rule": "/home/elib/code/motroco-document/personal/CLAUDE.md",
+    "external": {
+      "reddit_api_docs": "https://www.reddit.com/dev/api/",
+      "praw_docs": "https://praw.readthedocs.io/",
+      "oauth_token_endpoint": "https://www.reddit.com/api/v1/access_token",
+      "authenticated_api_base": "https://oauth.reddit.com"
+    }
+  },
+
+  "metadata": {
+    "manifest_version": 1,
+    "last_updated": "2026-04-27",
+    "updater_responsibility": "Whoever changes design (CLAUDE.md edits, new operations, schema bumps, panel reviews) must also update this manifest in the same change. Don't let the two drift."
+  }
+}
