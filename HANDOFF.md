@@ -1,7 +1,9 @@
 # Handoff — reddit_research
 
 **Updated:** 2026-04-27
-**Status:** design v3 (panel-reviewed twice). No code yet. **Phase 0 unblocked** — only remaining setup is Eli filling credential values into `/home/elib/code/reddit_api/.env` (use `.env.example` as the schema).
+**Status:** design v3 + Phase 0 spike v2 written. **Reddit API access request submitted 2026-04-27** via the support form (mandatory under Reddit's Responsible Builder Policy as of Nov 2025 — self-service script-app creation no longer available). Awaiting Reddit's response (target 7 days, often longer).
+
+**Spike cannot run until credentials are issued.** Spike script v2 has 1 P1 + 2 P2 known fixes pending from the round-4 panel review, but iterating on them is pointless until we can test against the live API.
 
 ## TL;DR
 
