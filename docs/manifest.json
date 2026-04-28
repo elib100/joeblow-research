@@ -24,7 +24,7 @@
     { "id": 8, "topic": "roadmap", "choice": "core library → CLI → MCP server", "rationale": "CLI provides cheap debug + personal-use surface. MCP is thin glue on top once core is proven." },
     { "id": 9, "topic": "caching_default", "choice": "cache by default (opt-out), fresh=True per-call to bypass", "rationale": "LLM shouldn't have to think about caching ergonomics. Fast-by-default is the point." },
     { "id": 10, "topic": "ttl_strategy", "choice": "three flat TTLs, no age-aware computation", "rationale": "Variable age-aware TTL was overengineered for the 'don't need data for long' research workflow. Add age-awareness later if it proves valuable." },
-    { "id": 11, "topic": "cache_object_form", "choice": "normalized PRAW objects serialized to JSON dict (NOT byte-for-byte raw)", "rationale": "PRAW returns hydrated objects, not raw payloads. Matches actual data flow." },
+    { "id": 11, "topic": "cache_object_form", "choice": "raw parsed JSON dicts as Reddit returned them", "rationale": ".json transport returns plain HTTP responses; no client-library translation layer means what's cached is what's served. Earlier PRAW-based plan needed the 'normalized objects' framing — that's moot now." },
     { "id": 12, "topic": "cache_key_includes_params", "choice": "cache key includes all retrieval params + normalization_version suffix", "rationale": "Without this, get_thread(top=20) cache-poisons get_thread(top=100). Discovered in second panel review." },
     { "id": 13, "topic": "error_caching_split", "choice": "403/404 cached 24h, 5xx never cached", "rationale": "Permanent vs transient. Caching 5xx would poison after one Reddit blip." },
     { "id": 14, "topic": "fullname_validation_in_core", "choice": "validate ^t[1-6]_[a-z0-9]+$ in core, not at MCP boundary", "rationale": "CLI gets the same protection as MCP. Cheap." },
@@ -79,11 +79,11 @@
     {
       "name": "status",
       "signature": "status()",
-      "returns": "Status (cache_size_bytes, cache_hit_rate, auth_limits, auth_state)",
+      "returns": "Status (cache_size_bytes, cache_hit_rate, last_seen_headroom, total_api_calls_this_session, last_call_status)",
       "cache_key_template": null,
       "ttl_kind": null,
       "caps": null,
-      "notes": "auth_state is one of: never_exercised, last_call_ok, last_call_failed:<reason> — distinguishes bad credentials from 'we just haven't called yet'."
+      "notes": "last_seen_headroom is the {used, remaining, reset_in_seconds} dict from the most recent X-Ratelimit-* response, or null if no calls have been made yet. last_call_status is the most recent HTTP status code (200, 429, 5xx, etc.) or 'none' if no calls have been made."
     }
   ],
 
@@ -105,7 +105,7 @@
           { "name": "cache_key", "type": "TEXT", "constraints": "NOT NULL", "notes": "includes all retrieval params + normalization_version (e.g. ':v1' suffix)" },
           { "name": "fetched_at", "type": "INTEGER", "constraints": "NOT NULL", "notes": "unix seconds" },
           { "name": "status_code", "type": "INTEGER", "constraints": "NOT NULL", "notes": "200 / 403 / 404" },
-          { "name": "body_json", "type": "TEXT", "constraints": "NOT NULL", "notes": "normalized PRAW object dict, or error metadata for non-200" }
+          { "name": "body_json", "type": "TEXT", "constraints": "NOT NULL", "notes": "raw parsed JSON as Reddit returned it (the .json endpoint response), or error metadata {reason, message, error} for non-200" }
         ],
         "primary_key": ["kind", "cache_key"]
       }
@@ -171,9 +171,9 @@
   ],
 
   "phase_0_checklist": [
-    { "step": 1, "task": "Auth check: confirm dev app authenticates + pulls one thread via PRAW", "blocking_for_mvp": true },
-    { "step": 2, "task": "Map error behavior: banned/private/deleted thread, observe prawcore exceptions, distinguish 403/404 from 5xx", "blocking_for_mvp": true },
-    { "step": 3, "task": "Verify replace_more(limit=10) on a real big thread", "blocking_for_mvp": true },
+    { "step": 1, "task": "Connectivity: confirm UA accepted, headroom headers populated, /r/python/hot.json returns 200 with expected shape", "blocking_for_mvp": true },
+    { "step": 2, "task": "Map error behavior: banned/private/nonexistent sub or thread, distinguish 404 / 403 (with reason field). Test redirect behavior for the v0.1 follow_redirects=False decision.", "blocking_for_mvp": true },
+    { "step": 3, "task": "Verify /api/morechildren.json with capped child list (limit=10)", "blocking_for_mvp": true },
     { "step": 4, "task": "Benchmark queries — 3-5 realistic queries with per-path measurement, real tokenizer counts, signal-to-noise ratio. Save as phase0_benchmarks.md + phase0_benchmarks.json", "blocking_for_mvp": false, "feeds_into": "v0.2 preprocessing design" },
     { "step": 5, "task": "Cache-hit/miss instrumentation in smoke test for baseline", "blocking_for_mvp": false }
   ],

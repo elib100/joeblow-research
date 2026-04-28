@@ -88,20 +88,34 @@ class RedditJSONClient:
         self.headroom: dict | None = None
         self.api_call_count = 0
         self.user_agent = user_agent
+        self.last_call_status: int | None = None
+
+    @staticmethod
+    def _try_float(s: str | None) -> float | None:
+        if s is None:
+            return None
+        try:
+            return float(s)
+        except (TypeError, ValueError):
+            return None
 
     def get(self, path: str, params: dict | None = None) -> tuple[Any, int]:
         """Issue a GET, observe rate-limit headers, return (parsed_json, status)."""
         self.api_call_count += 1
         r = self.client.get(path, params=params)
+        self.last_call_status = r.status_code
 
         used = r.headers.get("x-ratelimit-used")
         rem = r.headers.get("x-ratelimit-remaining")
         rst = r.headers.get("x-ratelimit-reset")
         if used is not None or rem is not None or rst is not None:
+            # Keep both parsed and raw so we can verify reset semantics
+            # (delta-seconds vs absolute-epoch) by inspecting the raw value.
             self.headroom = {
-                "used": float(used) if used is not None else None,
-                "remaining": float(rem) if rem is not None else None,
-                "reset_in_seconds": float(rst) if rst is not None else None,
+                "used": self._try_float(used),
+                "remaining": self._try_float(rem),
+                "reset_in_seconds": self._try_float(rst),
+                "reset_raw": rst,
             }
 
         try:
@@ -202,14 +216,15 @@ def probe_auth(client: RedditJSONClient) -> dict:
 
 
 def probe_errors(client: RedditJSONClient) -> dict:
-    """Map status codes + structured reason fields for known error cases."""
-    out: dict = {"name": "errors", "responses": {}}
+    """Map status codes + structured reason fields for known error cases.
+
+    Includes a redirect-detection sub-probe with follow_redirects=False so the
+    v0.1 library can default to that and decide redirect handling on real data
+    rather than guessing.
+    """
+    out: dict = {"name": "errors", "responses": {}, "redirects": {}}
     cases = [
-        (
-            "nonexistent_subreddit",
-            "/r/this_does_not_exist_zzz_qwerty99/hot.json",
-            None,
-        ),
+        ("nonexistent_subreddit", "/r/this_does_not_exist_zzz_qwerty99/hot.json", None),
         ("bogus_thread_id", "/comments/zzzzzz.json", None),
         ("premium_only_sub", "/r/lounge.json", None),
     ]
@@ -229,7 +244,87 @@ def probe_errors(client: RedditJSONClient) -> dict:
             out["responses"][label] = {
                 "transport_error": f"{type(e).__name__}: {e}"
             }
+
+    # Redirect probe — test a handful of URLs with follow_redirects=False to
+    # see what 3xx behavior looks like. Reddit redirects on banned subs,
+    # renamed subs, and missing trailing slashes; v0.1 should default to
+    # follow_redirects=False and handle 3xx explicitly.
+    redirect_targets = [
+        ("subreddit_no_sort", "/r/python.json"),       # may or may not redirect to /hot.json
+        ("subreddit_capitalized", "/r/Python.json"),   # case-handling check
+        ("famous_banned_sub", "/r/jailbait.json"),     # known long-banned, expected ban/redirect
+    ]
+    for label, path in redirect_targets:
+        try:
+            with httpx.Client(
+                base_url=RedditJSONClient.BASE,
+                headers={"User-Agent": client.user_agent},
+                timeout=30.0,
+                follow_redirects=False,
+            ) as nc:
+                rr = nc.get(path)
+            entry = {
+                "status": rr.status_code,
+                "location": rr.headers.get("location"),
+                "content_type": rr.headers.get("content-type"),
+            }
+            # If 3xx, log the redirect chain we'd have followed
+            if 300 <= rr.status_code < 400:
+                entry["is_redirect"] = True
+            out["redirects"][label] = entry
+        except Exception as e:
+            out["redirects"][label] = {
+                "transport_error": f"{type(e).__name__}: {e}"
+            }
+
     out["headroom_post"] = client.headroom
+    return out
+
+
+def probe_pagination(client: RedditJSONClient) -> dict:
+    """Verify after/before cursor pagination works as expected.
+
+    De-risks the v0.1 listing iterator design by confirming the cursor in one
+    response actually fetches the next page when passed back as `after`.
+    """
+    out: dict = {"name": "pagination", "details": {}, "errors": []}
+    try:
+        body1, status1 = client.get("/r/python/hot.json", {"limit": 5})
+        if status1 != 200 or not isinstance(body1, dict):
+            out["errors"].append(f"first listing failed: status={status1}")
+            return out
+        after = body1.get("data", {}).get("after")
+        before1 = body1.get("data", {}).get("before")
+        children1 = body1.get("data", {}).get("children", [])
+        ids1 = [c["data"]["id"] for c in children1]
+
+        if not after:
+            out["details"]["no_after_cursor"] = (
+                "first page returned no `after` field — small subreddit or end of feed"
+            )
+            return out
+
+        body2, status2 = client.get("/r/python/hot.json", {"limit": 5, "after": after})
+        children2 = body2.get("data", {}).get("children", [])
+        ids2 = [c["data"]["id"] for c in children2]
+        overlap = set(ids1) & set(ids2)
+
+        out["details"] = {
+            "page1_ids": ids1,
+            "page1_after": after,
+            "page1_before": before1,
+            "page2_ids": ids2,
+            "page2_status": status2,
+            "page2_after": body2.get("data", {}).get("after") if isinstance(body2, dict) else None,
+            "id_overlap_count": len(overlap),
+            "interpretation": (
+                "id_overlap_count should be 0 — page2 should be entirely different "
+                "items from page1. If non-zero, the after cursor isn't doing what we "
+                "think it is."
+            ),
+        }
+    except Exception as e:
+        out["errors"].append(f"{type(e).__module__}.{type(e).__name__}: {e}")
     return out
 
 
@@ -510,9 +605,13 @@ def probe_benchmarks(client: RedditJSONClient) -> dict:
                     comment_id = candidate["id"]
                     thread_id = t["post"]["id"]
                     sub = t["post"]["subreddit"]
+                    # context=0 constrains the response to the focal comment's
+                    # subtree only (no parent context). Resolves the round-5
+                    # panel disagreement: with context=0 we get just descendants;
+                    # we still log focal-vs-returned IDs to verify empirically.
                     exp_body, exp_status = client.get(
                         f"/r/{sub}/comments/{thread_id}/_/{comment_id}.json",
-                        {"limit": 20, "depth": 5},
+                        {"limit": 20, "depth": 5, "context": 0},
                     )
                     if exp_status != 200 or not isinstance(exp_body, list) or len(exp_body) < 2:
                         continue
@@ -520,10 +619,16 @@ def probe_benchmarks(client: RedditJSONClient) -> dict:
                     walk_comment_tree(
                         exp_body[1]["data"]["children"], subtree
                     )
-                    exp_full = full_size(exp_body)
+                    # Excludes element [0] (the post payload) — only the
+                    # comment-listing payload counts as "this expand step's cost."
+                    exp_full = full_size(exp_body[1])
                     exp_signal = sum(
                         len(json.dumps(comment_signal(c))) for c in subtree
                     )
+                    # Log focal-vs-returned t1 IDs so we can see whether non-descendants
+                    # appeared (they shouldn't with context=0; this is the empirical check).
+                    returned_t1_ids = [c.get("id") for c in subtree if c.get("id")]
+                    focal_in_returned = comment_id in returned_t1_ids
                     marginal_full += exp_full
                     marginal_signal += exp_signal
                     marginal_text_parts.append(
@@ -536,6 +641,9 @@ def probe_benchmarks(client: RedditJSONClient) -> dict:
                             "subtree_comments_total": len(subtree),
                             "subtree_full_bytes": exp_full,
                             "subtree_signal_bytes": exp_signal,
+                            "focal_in_returned": focal_in_returned,
+                            "returned_t1_count": len(returned_t1_ids),
+                            "returned_t1_first_5": returned_t1_ids[:5],
                         }
                     )
 
@@ -680,6 +788,19 @@ def write_outputs(probes: list[dict], client: RedditJSONClient) -> None:
         "are stable; absolute token counts are advisory.",
         "- **`full_bytes` is the actual JSON response size** Reddit returned — no "
         "object-graph noise from a wrapper library, so SNR ratios are trustworthy.",
+        "- **`walk_comment_tree` ignores `more` markers** in the comment tree — "
+        "`subtree_comments_total` is therefore a *lower bound* on the comments "
+        "actually present in the thread, not an exact count. Expanding the `more` "
+        "markers would require additional /api/morechildren calls (deliberately "
+        "skipped here to constrain rate budget).",
+        "- **Path 3 `subtree_full_bytes` excludes the post payload** (element [0] "
+        "of the `[post, comment_listing]` response). It measures only the comment "
+        "subtree we actually came for. SNR ratio for Path 3 is therefore "
+        "comments-only and directly comparable to Path 2's comment portion.",
+        "- **Path 3 uses `context=0`** to constrain the response to the focal "
+        "comment's descendants only (no parent context). Each expansion logs "
+        "`focal_in_returned` + `returned_t1_first_5` so we can empirically verify "
+        "no non-descendants leaked in.",
         "",
         "## Probe results (errors only — see phase0_benchmarks.{md,json} for benchmarks)",
         "",
@@ -706,7 +827,7 @@ def main() -> None:
     parser.add_argument(
         "--probe",
         default="all",
-        choices=["all", "auth", "errors", "morechildren", "benchmarks"],
+        choices=["all", "auth", "errors", "pagination", "morechildren", "benchmarks"],
     )
     args = parser.parse_args()
 
@@ -721,6 +842,7 @@ def main() -> None:
     runners = [
         ("auth", probe_auth),
         ("errors", probe_errors),
+        ("pagination", probe_pagination),
         ("morechildren", probe_more_comments),
         ("benchmarks", probe_benchmarks),
     ]
