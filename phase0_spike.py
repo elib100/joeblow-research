@@ -331,30 +331,48 @@ def probe_pagination(client: RedditJSONClient) -> dict:
 def probe_more_comments(client: RedditJSONClient) -> dict:
     """Verify /api/morechildren.json behavior with a capped child list.
 
-    Picks a thread with 200–3000 comments (avoids the 50k+ AskReddit-top-all-time
-    pitfall). Sends a 10-id child list to constrain rate-budget cost to one call.
+    Picks a thread with 50–5000 comments (avoids the 50k+ AskReddit-top-all-time
+    pitfall). Tries several subs/sorts as fallback so the probe works regardless
+    of which subs happen to have moderate-traffic threads today. Sends a 10-id
+    child list to constrain rate-budget cost to one call.
     """
     out: dict = {"name": "more_comments", "details": {}, "errors": []}
+    candidate: dict | None = None
+    listing_searched: list[str] = []
     try:
-        listing, status = client.get("/r/python/top.json", {"limit": 15, "t": "month"})
-        if status != 200:
-            out["errors"].append(f"listing fetch failed: status={status}")
-            return out
-
-        candidate = None
-        for c in listing["data"]["children"]:
-            d = c["data"]
-            if 200 <= d.get("num_comments", 0) <= 3000:
-                candidate = d
+        # Try several listings until we find a thread in the size sweet spot.
+        candidates_to_try = [
+            ("/r/python/top.json", {"limit": 15, "t": "month"}),
+            ("/r/programming/top.json", {"limit": 15, "t": "month"}),
+            ("/r/python/hot.json", {"limit": 25}),
+            ("/r/AskScience/top.json", {"limit": 15, "t": "week"}),
+            ("/r/explainlikeimfive/top.json", {"limit": 15, "t": "week"}),
+        ]
+        for path, params in candidates_to_try:
+            listing_searched.append(path)
+            listing, status = client.get(path, params)
+            if status != 200 or not isinstance(listing, dict):
+                continue
+            for c in listing.get("data", {}).get("children", []):
+                d = c["data"]
+                if 50 <= d.get("num_comments", 0) <= 5000:
+                    candidate = d
+                    break
+            if candidate is not None:
                 break
+
         if candidate is None:
             out["errors"].append(
-                "no thread with 200-3000 comments in r/python top/month — try a different sub"
+                f"no thread with 50-5000 comments found across {len(listing_searched)} "
+                f"listings: {listing_searched}"
             )
             return out
 
+        # Use limit=20 (not 100) on the thread fetch — Reddit's truncation at
+        # this size guarantees a 'more' marker for any thread with >20 top-level
+        # comments, which is what we need to exercise /api/morechildren.json.
         thread_body, t_status = client.get(
-            f"/comments/{candidate['id']}.json", {"limit": 100}
+            f"/comments/{candidate['id']}.json", {"limit": 20}
         )
         if t_status != 200:
             out["errors"].append(f"thread fetch failed: status={t_status}")

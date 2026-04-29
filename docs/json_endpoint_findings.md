@@ -27,15 +27,55 @@ Returns the **exact same JSON structure as the OAuth API** — `Listing` → `t3
 - **Reset window is ~600 seconds** (10 min), not 60. So the actual budget is ~100 calls per 10-minute sliding window — meaningfully more generous than the published 60-100 QPM figure.
 - For a typical research session (50–100 calls, then idle for 30+ min), this is plenty.
 
-## Edge cases mapped
+## Edge cases mapped (spike confirmed 2026-04-29)
 
-| Scenario | Status | Body | Distinguishable? |
+| Scenario | Status | Body | Notes |
 |---|---|---|---|
-| Nonexistent subreddit | `404` | `{"message":"404 Not Found","error":404}` | ✓ |
-| Bogus thread id | `404` | same shape | ✓ |
-| Premium-only sub (r/lounge) | `403` | `{"reason":"gold_only","message":"Forbidden","error":403}` | ✓ — `reason` field discriminates |
+| Nonexistent subreddit | `404` | `{"message":"Not Found","error":404}` | No `reason` field. |
+| Bogus thread id | **`403`** (not 404) | `{"message":"Forbidden","error":403}` | **Surprise:** Reddit returns Forbidden for invalid thread IDs, not Not Found. No `reason` field. v0.1 should not assume thread-not-found = 404. |
+| Premium-only sub (r/lounge) | `403` | `{"reason":"gold_only","message":"Forbidden","error":403}` | `reason` field present. |
+| Famous banned sub (r/jailbait) | `404` | same shape as nonexistent | Reddit returns 404 (not 451 or 403) for long-banned subs. Indistinguishable from nonexistent. |
 
-This is **better error data** than PRAW typically surfaces — the `reason` field gives a structured reason for forbidden access (`gold_only`, `private`, `banned`, `quarantined`, etc.), which the OAuth flow loses behind a generic `Forbidden` exception.
+**Implication for `core/errors.py`:** distinguish on (status, presence of `reason` field) rather than on status alone. The `reason` field gives structured discrimination for Gold/private/quarantined/banned, but bare 403/404 with no `reason` covers multiple cases (banned subs, deleted threads, invalid IDs, never-existed subs).
+
+## Redirect behavior (spike confirmed 2026-04-29)
+
+Tested three URLs with `follow_redirects=False`:
+
+| URL | Status | Notes |
+|---|---|---|
+| `/r/python.json` (no sort suffix) | `200` | No redirect — Reddit serves directly |
+| `/r/Python.json` (capitalized) | `200` | Reddit normalizes case server-side without 3xx |
+| `/r/jailbait.json` (banned sub) | `404` | No redirect — direct 404 |
+
+**v0.1 default `follow_redirects=False` is safe** — none of the tested cases produce 3xx. If Reddit ever starts issuing redirects for new cases, `core/client.py` should log + handle them explicitly rather than silently follow.
+
+## Pagination cursor (spike confirmed 2026-04-29)
+
+`/r/python/hot.json?limit=5` then `?limit=5&after=t3_<id>` returned page 2 with **zero overlap** with page 1. Cursor pagination works as expected. The `after` field on a Listing response is the next-page cursor; `before` is null on the first page.
+
+## `/api/morechildren.json` behavior (spike confirmed 2026-04-29)
+
+- Takes `link_id=t3_<thread>` and `children=<comma-separated id list>`.
+- Returns one call's worth of comments — `things_returned` ≤ `children_requested` (some may be deleted/removed; that's expected, not a failure).
+- One HTTP call regardless of child-list length.
+- Test case: thread with 91 num_comments + a `more` marker for 26 unloaded children → requested 10 → got 6 back in 0.18s, one rate-budget unit.
+
+## Path-3 endpoint behavior (spike confirmed 2026-04-29)
+
+`/r/<sub>/comments/<thread>/_/<comment>.json?context=0&depth=N&limit=M` returns `[post, comment_listing]` where the comment listing is **focal-comment + descendants only** (no parent/sibling context when `context=0`). Spike empirically verified across 15 expansion calls: `focal_in_returned=True` for every one, no non-descendant t1 IDs leaked in. Codex's round-5 concern was preempted by the `context=0` parameter; Opus's interpretation was correct.
+
+## Signal-to-noise ratios (spike measured 2026-04-29)
+
+For 5 realistic research queries × 3 paths each (`tiktoken cl100k_base` for token counts):
+
+| Path | Avg SNR | Range |
+|---|---|---|
+| `list_only` (search/listing only) | ~24% | 7%–31% |
+| `list_plus_threads_top20` | **~10%** | 4%–14% |
+| `list_plus_threads_plus_expand_one` (marginal cost of one expand) | ~16% | 10%–23% |
+
+**90% of comment-response payload is operational metadata** (`banned_by`, `link_flair_richtext`, gilding history, awarders, media_embed, etc.). The v0.2 markdown-preprocessor has ~10× token leverage on the most expensive path. Worth shipping.
 
 ## Trade-offs vs OAuth + PRAW
 
