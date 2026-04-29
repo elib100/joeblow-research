@@ -17,6 +17,7 @@ dist/
 .venv/
 venv/
 env/
+src/*.egg-info/
 
 # Test/cache artifacts
 .pytest_cache/

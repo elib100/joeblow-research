@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reddit-research"
+version = "0.1.0"
+description = "Personal Reddit research tool — search subreddits and summarize threads via an LLM."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Eli Bottrell" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet",
+    "Topic :: Utilities",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "tiktoken>=0.5",
+]
+
+[project.scripts]
+reddit-cli = "reddit_research.cli.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/elib100/joeblow-research"
+Repository = "https://github.com/elib100/joeblow-research"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+reddit_research = ["py.typed"]
