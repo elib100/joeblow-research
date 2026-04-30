@@ -135,11 +135,17 @@ class RedditJSONClient:
         :class:`TransportError` on network failure. 429 is honored with up to
         :data:`MAX_429_RETRIES` retry pass(es) using ``Retry-After``.
 
+        Budget semantics (per the round-6 panel review): one ``get()`` call
+        counts as one budget unit regardless of internal retries — i.e.
+        "logical operation," not "actual upstream call". DNS/connect failures
+        before the retry loop also consume a budget unit; this is acceptable
+        because exhausting budget on transport errors is a correct signal that
+        something's wrong, and the failure cap (50 by default) is large enough
+        that the cost is bounded.
+
         Note: this isn't backwards-compatible with the spike's
         ``(body, status)`` return tuple — at the library level, raising on
-        non-2xx is more idiomatic. The spike returned status because it was
-        deliberately probing error paths; production callers should catch the
-        typed exceptions instead.
+        non-2xx is more idiomatic.
         """
         if self.budget is not None:
             self.budget.spend_api_call()
@@ -163,9 +169,12 @@ class RedditJSONClient:
                 return self._parse_body(r)
 
             # Non-2xx — let the typed-exception mapper decide what to raise.
+            # Pass r.headers directly (httpx.Headers is case-insensitive);
+            # converting to dict() loses that and silently breaks Retry-After
+            # / Location lookups when httpx preserves canonical casing.
             body = self._parse_body(r, allow_non_json=True)
             exc = from_http_response(
-                r.status_code, path, body, headers=dict(r.headers)
+                r.status_code, path, body, headers=r.headers
             )
 
             # 429 retry: honor Retry-After once if we have budget for it.
@@ -217,10 +226,18 @@ class RedditJSONClient:
         rst = headers.get("x-ratelimit-reset")
         if used is None and rem is None and rst is None:
             return
+        rst_seconds = _try_float(rst)
+        # Store an absolute monotonic deadline, not the raw seconds-from-now.
+        # Without this, multiple gets() between low-headroom and the next
+        # backoff trigger reuse a stale value and oversleep (round-6 P1).
+        reset_at_monotonic: float | None = None
+        if rst_seconds is not None:
+            reset_at_monotonic = time.monotonic() + rst_seconds
         self.headroom = {
             "used": _try_float(used),
             "remaining": _try_float(rem),
-            "reset_in_seconds": _try_float(rst),
+            "reset_in_seconds": rst_seconds,
+            "reset_at_monotonic": reset_at_monotonic,
             "reset_raw": rst,
         }
 
@@ -228,24 +245,33 @@ class RedditJSONClient:
         if self.headroom is None:
             return
         rem = self.headroom.get("remaining")
-        rst = self.headroom.get("reset_in_seconds")
-        if rem is None or rst is None:
+        reset_at = self.headroom.get("reset_at_monotonic")
+        if rem is None or reset_at is None:
             return
-        if rem < HEADROOM_BACKOFF_THRESHOLD:
-            wait = max(rst, 1.0)
-            if wait > MAX_RETRY_AFTER_SECONDS:
-                logger.warning(
-                    "Headroom low (remaining=%.1f) but reset=%ss exceeds cap; not backing off",
-                    rem,
-                    rst,
-                )
-                return
-            logger.info(
-                "Headroom remaining=%.1f below threshold; sleeping %.1fs until reset",
-                rem,
-                wait,
+        if rem >= HEADROOM_BACKOFF_THRESHOLD:
+            return
+        wait = max(reset_at - time.monotonic(), 0.0)
+        if wait <= 0.0:
+            # Reset window has already passed; the stale `remaining` will
+            # get refreshed on the next response. Press on.
+            return
+        if wait > MAX_RETRY_AFTER_SECONDS:
+            # Round-6 P1 (Opus): don't silently press on into near-exhaustion.
+            # Raise so the caller can decide whether to wait or abort.
+            from reddit_research.core.errors import RateLimitError
+            raise RateLimitError(
+                status=429,
+                path="<proactive-backoff>",
+                body={"reason": "headroom_exhausted", "remaining": rem,
+                      "reset_in_seconds": wait},
+                retry_after=wait,
             )
-            time.sleep(wait + 0.5)
+        logger.info(
+            "Headroom remaining=%.1f below threshold; sleeping %.1fs until reset",
+            rem,
+            wait,
+        )
+        time.sleep(wait + 0.5)
 
 
 # ---- Helpers --------------------------------------------------------------

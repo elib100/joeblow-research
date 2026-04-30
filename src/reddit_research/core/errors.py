@@ -84,8 +84,10 @@ class RateLimitError(HTTPError):
         path: str,
         body: object,
         retry_after: float | None = None,
+        reason: str | None = None,
+        message: str | None = None,
     ) -> None:
-        super().__init__(status, path, body)
+        super().__init__(status, path, body, reason=reason, message=message)
         self.retry_after = retry_after
 
 
@@ -144,35 +146,54 @@ def from_http_response(
     status: int,
     path: str,
     body: object,
-    headers: dict | None = None,
+    headers: object = None,
 ) -> HTTPError:
     """Build the appropriate :class:`HTTPError` subclass from a Reddit response.
 
     Centralizes the mapping so :mod:`reddit_research.core.client` doesn't have
     to repeat it. Caller is responsible for ensuring this is invoked on
     non-2xx responses only.
+
+    `headers` should be a case-insensitive mapping (e.g. ``httpx.Headers``).
+    A plain ``dict`` works for known-lowercase keys but loses case-insensitivity;
+    the round-6 panel found that converting ``httpx.Headers`` to ``dict()``
+    silently broke ``Retry-After`` / ``Location`` lookups when httpx preserved
+    canonical casing. Always pass the original ``r.headers``.
     """
-    headers = headers or {}
+
+    def _h(name: str) -> str | None:
+        if headers is None:
+            return None
+        try:
+            return headers.get(name)  # type: ignore[union-attr]
+        except (AttributeError, TypeError):
+            return None
+
     reason = None
     message = None
     if isinstance(body, dict):
         reason = body.get("reason")
         message = body.get("message")
     if 300 <= status < 400:
-        return RedirectError(status, path, body, location=headers.get("location"))
+        return RedirectError(status, path, body, location=_h("location"))
     if status == 404:
         return NotFoundError(status, path, body, reason=reason, message=message)
     if status == 403:
         return ForbiddenError(status, path, body, reason=reason, message=message)
     if status == 429:
-        retry_after_raw = headers.get("retry-after")
+        retry_after_raw = _h("retry-after")
         retry_after: float | None = None
         if retry_after_raw is not None:
             try:
                 retry_after = float(retry_after_raw)
             except (TypeError, ValueError):
                 retry_after = None
-        return RateLimitError(status, path, body, retry_after=retry_after)
+        return RateLimitError(
+            status, path, body,
+            retry_after=retry_after,
+            reason=reason,
+            message=message,
+        )
     if 500 <= status < 600:
         return UpstreamError(status, path, body, reason=reason, message=message)
     return HTTPError(status, path, body, reason=reason, message=message)

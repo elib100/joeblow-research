@@ -8,7 +8,7 @@ plus environment variables. All keys have sensible defaults; only
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -59,13 +59,16 @@ def load_config(env_file: Path | str | None = None) -> Config:
 
     Args:
         env_file: path to a ``.env`` file. If ``None``, looks for ``./.env``
-            relative to the working directory; if no file is found, only
-            actual environment variables are used.
+            in the current working directory only. **Does not walk up parent
+            directories** — that would risk leaking config from an unrelated
+            parent repo or shell context (round-6 panel finding).
     """
     if env_file is not None:
         load_dotenv(env_file, override=False)
     else:
-        load_dotenv(override=False)  # auto-discovers ./.env
+        cwd_env = Path.cwd() / ".env"
+        if cwd_env.is_file():
+            load_dotenv(cwd_env, override=False)
 
     user_agent = os.environ.get("REDDIT_USER_AGENT", DEFAULT_USER_AGENT).strip()
     if not user_agent:

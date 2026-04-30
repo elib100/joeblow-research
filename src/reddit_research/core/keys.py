@@ -49,6 +49,11 @@ def validate_id_or_fullname(value: str, expect_kind: str | None = None) -> str:
 
     Returns the *bare id*, stripping any prefix. Used by operations that
     accept either form for ergonomics.
+
+    When ``expect_kind`` is set, bare ids are rejected — callers must use the
+    fully-qualified fullname so the kind is verifiable. (Round 6 panel: bare
+    ids cannot be safely validated against expect_kind because no kind info
+    is in them.)
     """
     from reddit_research.core.errors import InvalidIdError
 
@@ -58,6 +63,11 @@ def validate_id_or_fullname(value: str, expect_kind: str | None = None) -> str:
         validate_fullname(value, expect_kind=expect_kind)
         return value.split("_", 1)[1]
     if _BARE_ID_RE.match(value):
+        if expect_kind is not None:
+            raise InvalidIdError(
+                f"bare id {value!r} cannot be validated against expect_kind="
+                f"{expect_kind!r} — pass the full fullname (e.g. {expect_kind}_{value})"
+            )
         return value
     raise InvalidIdError(f"not a valid Reddit id or fullname: {value!r}")
 
@@ -105,12 +115,15 @@ def search_key(
 
 
 def listing_key(name: str, sort: str, limit: int, time_filter: str | None = None) -> str:
-    """Subreddit listing cache key."""
+    """Subreddit listing cache key.
+
+    `time_filter` is always included with an explicit default of "all" — Reddit
+    treats omitted t= as t=all on top/controversial sorts, so two callers
+    spelling the same query differently must collide on one cache entry.
+    """
     sub = (name or "").lower()
-    parts = [f"listing:r/{sub}", str(sort), f"l{int(limit)}"]
-    if time_filter:
-        parts.append(f"t{time_filter}")
-    parts.append(NORMALIZATION_VERSION)
+    tf = time_filter or "all"
+    parts = [f"listing:r/{sub}", str(sort), f"l{int(limit)}", f"t{tf}", NORMALIZATION_VERSION]
     return ":".join(parts)
 
 
