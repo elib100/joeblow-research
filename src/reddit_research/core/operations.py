@@ -29,9 +29,11 @@ when they need JSON.
 
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass, field
+import logging
+from dataclasses import dataclass
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from reddit_research.core.cache import Cache, CacheStats
 from reddit_research.core.client import RedditJSONClient
@@ -209,8 +211,16 @@ class Operations:
         *,
         fresh: bool = False,
     ) -> list[ThreadSummary]:
-        """Fetch a subreddit listing — hot/new/top/rising/controversial."""
-        key = listing_key(name, sort, limit, time_filter)
+        """Fetch a subreddit listing — hot/new/top/rising/controversial.
+
+        ``time_filter`` only affects ``top`` and ``controversial`` sorts;
+        Reddit ignores it on others. We omit it from both the API request
+        AND the cache key for irrelevant sorts so two callers spelling the
+        same query differently collide on one entry (round-7 panel).
+        """
+        sort_uses_time = sort in ("top", "controversial")
+        effective_time_filter = time_filter if sort_uses_time else None
+        key = listing_key(name, sort, limit, effective_time_filter)
         if not fresh:
             hit = self._cache.get("listing", key)
             if hit is not None:
@@ -218,7 +228,7 @@ class Operations:
                 return _parse_listing_children(hit.body)
 
         params: dict[str, Any] = {"limit": int(limit)}
-        if sort in ("top", "controversial"):
+        if sort_uses_time:
             params["t"] = time_filter
         path = f"/r/{name.lower()}/{sort}.json"
 
@@ -232,9 +242,18 @@ class Operations:
         *,
         fresh: bool = False,
     ) -> Thread:
-        """Fetch a thread + its top-N top-level comments by score."""
+        """Fetch a thread + the first ``top_n_comments`` top-level comments
+        Reddit returns (Reddit's own ranking — typically ``best``/``confidence``).
+
+        ``thread_id`` may be a bare id (``abc123``) or fullname (``t3_abc123``).
+        Round-7 panel: the previous "top by score" framing was misleading
+        because Reddit's ``limit`` truncates server-side using its own ranking,
+        so re-sorting the truncated subset doesn't reveal higher-scored
+        comments outside Reddit's first-N window. Caller can sort the
+        returned ``comments`` tuple if a specific order is needed.
+        """
         key = thread_key(thread_id, top_n_comments)
-        bare = validate_id_or_fullname(thread_id, expect_kind="t3")
+        bare = validate_id_or_fullname(thread_id)
 
         if not fresh:
             hit = self._cache.get("thread", key)
@@ -279,8 +298,11 @@ class Operations:
             )
 
         key = comment_subtree_key(thread_id, comment_id, depth, limit)
-        bare_thread = validate_id_or_fullname(thread_id, expect_kind="t3")
-        bare_comment = validate_id_or_fullname(comment_id, expect_kind="t1")
+        # Accept bare or fullname (CLAUDE.md API contract). Wrong-kind IDs
+        # surface as Reddit 404/403 rather than a local validation error —
+        # acceptable trade-off for ergonomics.
+        bare_thread = validate_id_or_fullname(thread_id)
+        bare_comment = validate_id_or_fullname(comment_id)
         sub = subreddit.lower()
 
         if not fresh:
@@ -342,44 +364,82 @@ class Operations:
     ) -> Any:
         """Issue a GET, cache result (200 → put, 403/404 → put_error), return body.
 
-        Transient errors (5xx, transport) propagate without caching. The
-        client itself raises typed exceptions — :class:`HTTPError` subclasses
-        for HTTP problems, :class:`TransportError` for network failures.
+        Cache writes are best-effort: a cache failure (disk full, schema
+        mismatch, etc.) is logged but never blocks the original transport
+        outcome from propagating to the caller. This is the round-7 panel
+        finding: caching is observability/optimization; it must not change
+        operation semantics.
+
+        Transient errors (5xx, transport, redirect, budget-exceeded) are
+        re-raised without being cached.
         """
         try:
             body = self._client.get(path, params=params)
         except (NotFoundError, ForbiddenError) as e:
-            self._cache.put_error(
-                kind, key, e.status, _error_body_for_cache(e)
-            )
+            try:
+                self._cache.put_error(
+                    kind, key, e.status, _error_body_for_cache(e, path)
+                )
+            except Exception as cache_exc:
+                logger.warning(
+                    "cache.put_error failed for %s %s: %s",
+                    kind, key, cache_exc,
+                )
             raise
-        # Note: 5xx (UpstreamError), 429 (RateLimitError after retry),
-        # TransportError, RedirectError, BudgetExceededError all propagate
-        # to the caller without being cached. That's intentional — caching
-        # transient failures would poison the entry.
-        self._cache.put(kind, key, body, status_code=200)
+        try:
+            self._cache.put(kind, key, body, status_code=200)
+        except Exception as cache_exc:
+            logger.warning(
+                "cache.put failed for %s %s: %s",
+                kind, key, cache_exc,
+            )
         return body
 
     def _raise_if_cached_error(self, hit, key: str) -> None:
-        """If a cache hit holds a 403/404, replay the error to the caller."""
+        """If a cache hit holds a 403/404, replay the original error.
+
+        The cached error body includes the original request path (stored by
+        ``_error_body_for_cache``) so the replayed exception's ``.path`` is
+        the URL the user requested, not the cache key.
+        """
         if hit.status_code == 200:
             return
-        # Reconstruct an exception from the cached error body. body shape:
-        # {"reason": ..., "message": ...} as stored by put_error via
-        # _error_body_for_cache.
-        raise from_http_response(hit.status_code, key, hit.body)
+        body = hit.body if isinstance(hit.body, dict) else {}
+        original_path = body.get("_request_path") or key
+        # Pass only the discriminator fields to from_http_response — the
+        # ``_request_path`` key is internal cache metadata and shouldn't
+        # show up in the exception body.
+        replay_body = {k: v for k, v in body.items() if not k.startswith("_")}
+        raise from_http_response(hit.status_code, original_path, replay_body)
 
 
 # ---- Parsers --------------------------------------------------------------
 
 
 def _parse_listing_children(body: Any) -> list[ThreadSummary]:
-    """Parse a Listing response into ThreadSummary list. Tolerates wrong
-    shapes by returning empty rather than raising — the cache lookup might
-    rarely hit a malformed entry, and operations callers shouldn't crash."""
+    """Parse a Listing response into ThreadSummary list.
+
+    Round-7 panel: raise ``ValueError`` on shape mismatch rather than
+    silently returning ``[]``. Silent degradation is harder to detect than
+    a loud failure, and a bad 200 cached for the full TTL is worse than a
+    crash that surfaces a Reddit schema change. Individual non-t3 children
+    are skipped (mixed listings can include sub/user kinds), but a missing
+    ``data.children`` array is a hard error.
+    """
     if not isinstance(body, dict):
-        return []
-    children = body.get("data", {}).get("children", [])
+        raise ValueError(
+            f"listing response not a dict: type={type(body).__name__}"
+        )
+    data = body.get("data")
+    if not isinstance(data, dict) or "children" not in data:
+        raise ValueError(
+            "listing response missing data.children — possible Reddit schema change"
+        )
+    children = data.get("children", [])
+    if not isinstance(children, list):
+        raise ValueError(
+            f"listing data.children not a list: type={type(children).__name__}"
+        )
     return [
         _thread_summary(c["data"])
         for c in children
@@ -388,7 +448,14 @@ def _parse_listing_children(body: Any) -> list[ThreadSummary]:
 
 
 def _parse_thread(body: Any, top_n_comments: int) -> Thread:
-    """Parse a /comments/<id>.json response: ``[post_listing, comment_listing]``."""
+    """Parse a /comments/<id>.json response: ``[post_listing, comment_listing]``.
+
+    Returns top-level comments in **Reddit's order** (typically
+    ``best``/``confidence`` ranking). Truncated to at most ``top_n_comments``.
+    Round-7 panel: do NOT re-sort by score — Reddit already truncated by its
+    own ranking, so a local re-sort can't reveal higher-scored comments
+    outside Reddit's first-N window. Caller sorts if needed.
+    """
     if not (isinstance(body, list) and len(body) >= 2):
         raise ValueError(
             f"unexpected thread response shape: type={type(body).__name__} "
@@ -404,11 +471,8 @@ def _parse_thread(body: Any, top_n_comments: int) -> Thread:
         _comment_summary(c["data"], depth=0)
         for c in comment_children
         if isinstance(c, dict) and c.get("kind") == "t1" and isinstance(c.get("data"), dict)
-    )
-    # Sort by score desc, take top N. Reddit's default `limit` returns at most
-    # N top-level items but we sort to make rank deterministic regardless.
-    top_n = tuple(sorted(top_level, key=lambda c: c.score, reverse=True)[:top_n_comments])
-    return Thread(post=post, comments=top_n)
+    )[:top_n_comments]
+    return Thread(post=post, comments=top_level)
 
 
 def _parse_comment_tree(body: Any, focal_comment_id: str) -> CommentTree:
@@ -500,14 +564,17 @@ def _count_comments(c: CommentSummary) -> int:
     return 1 + sum(_count_comments(r) for r in c.replies)
 
 
-def _error_body_for_cache(e: HTTPError) -> dict:
+def _error_body_for_cache(e: HTTPError, request_path: str) -> dict:
     """Distill a typed HTTPError into the dict shape we cache.
 
     We don't cache the raw HTTP body — just the discriminator fields (reason,
-    message) plus the status. That's enough to re-raise the original error
-    when the cache returns a hit.
+    message) plus the status. The original request path is stored under the
+    underscore-prefixed ``_request_path`` key so the replayed exception's
+    ``.path`` attribute is the URL the user requested, not the cache key
+    (round-7 panel).
     """
     return {
         "reason": e.reason,
         "message": e.message,
+        "_request_path": request_path,
     }
