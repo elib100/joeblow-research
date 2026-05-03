@@ -33,9 +33,15 @@ def main() -> int:
         client = RedditJSONClient(user_agent=cfg.user_agent, budget=budget)
         cache = Cache(Path(td) / "smoke.db")
         with Operations(client=client, cache=cache) as ops:
-            # 1. status before any call
+            # 1. status before any call. Use explicit if/raise rather than
+            # `assert` so the check survives `python -O` (round-8 panel).
             s0 = ops.status()
-            assert s0.total_api_calls == 0, f"expected 0 api_calls initially, got {s0.total_api_calls}"
+            if s0.total_api_calls != 0:
+                print(
+                    f"FAIL: expected 0 api_calls initially, got {s0.total_api_calls}",
+                    file=sys.stderr,
+                )
+                return 1
             print(f"  initial: api_calls={s0.total_api_calls}")
 
             # 2. one listing

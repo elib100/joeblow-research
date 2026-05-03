@@ -174,6 +174,8 @@ class Operations:
         fresh: bool = False,
     ) -> list[ThreadSummary]:
         """Search Reddit. ``subreddit=None`` means search-all."""
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1; got {limit}")
         key = search_key(query, subreddit, sort, time_filter, limit)
         if not fresh:
             hit = self._cache.get("search", key)
@@ -218,6 +220,8 @@ class Operations:
         AND the cache key for irrelevant sorts so two callers spelling the
         same query differently collide on one entry (round-7 panel).
         """
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1; got {limit}")
         sort_uses_time = sort in ("top", "controversial")
         effective_time_filter = time_filter if sort_uses_time else None
         key = listing_key(name, sort, limit, effective_time_filter)
@@ -252,6 +256,8 @@ class Operations:
         comments outside Reddit's first-N window. Caller can sort the
         returned ``comments`` tuple if a specific order is needed.
         """
+        if top_n_comments < 1:
+            raise ValueError(f"top_n_comments must be >= 1; got {top_n_comments}")
         key = thread_key(thread_id, top_n_comments)
         bare = validate_id_or_fullname(thread_id)
 
@@ -266,10 +272,12 @@ class Operations:
 
         body = self._call_and_cache("thread", key, path, params)
         thread = _parse_thread(body, top_n_comments)
-        # Round-5 panel: charge comment budget after parsing — the operations
-        # layer is the only place that knows the comment count.
+        # Charge comment budget after parsing. Round-8 panel: count includes
+        # nested replies (Reddit's response packs replies inside top-level
+        # comments — top_level_count alone undercounts what the LLM consumed).
         if self._client.budget is not None:
-            self._client.budget.spend_comments(len(thread.comments))
+            total = sum(_count_comments(c) for c in thread.comments)
+            self._client.budget.spend_comments(total)
         return thread
 
     def expand_comment(

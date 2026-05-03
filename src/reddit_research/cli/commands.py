@@ -90,6 +90,19 @@ def _run(args: argparse.Namespace, fn: Callable[[Operations, argparse.Namespace]
     except RedditError as e:
         print(f"reddit-cli: error — {e}", file=sys.stderr)
         return 1
+    except (ValueError, RuntimeError) as e:
+        # Round-8 panel: strict parsers raise ValueError on Reddit schema drift,
+        # cap validators raise ValueError on out-of-range args, cache schema
+        # mismatch raises RuntimeError. None of these are RedditError subclasses;
+        # without this catch the user gets a raw traceback and the exit-code
+        # contract breaks.
+        print(f"reddit-cli: invalid input or unexpected response — {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        # Last-resort safety net. Print the type so it's clearly distinct from
+        # the typed-exception cases above.
+        print(f"reddit-cli: unexpected error — {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
 
 
 # ---- Commands ------------------------------------------------------------

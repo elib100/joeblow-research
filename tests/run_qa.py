@@ -602,6 +602,238 @@ def test_ops_listing_uses_no_time_for_hot():
 
 
 @test
+def test_ops_expand_comment_happy_path():
+    """Round-8 fix: exercise _parse_comment_tree end-to-end.
+
+    Reddit's expand response is the same ``[post_listing, comment_listing]``
+    shape as a thread fetch; with ``context=0`` the comment_listing should
+    contain the focal comment (with descendants nested in `replies`) as its
+    sole top-level entry.
+    """
+    def handler(req):
+        return httpx.Response(200, json=[
+            {"kind": "Listing", "data": {"children": [
+                {"kind": "t3", "data": _MIN_POST}
+            ]}},
+            {"kind": "Listing", "data": {"children": [
+                {"kind": "t1", "data": {
+                    "id": "focal", "body": "root comment", "author": "a",
+                    "score": 5, "created_utc": 0, "parent_id": "t3_abc",
+                    "replies": {"kind": "Listing", "data": {"children": [
+                        {"kind": "t1", "data": {
+                            "id": "reply1", "body": "reply", "author": "b",
+                            "score": 2, "created_utc": 0, "parent_id": "t1_focal",
+                        }},
+                    ]}},
+                }},
+            ]}},
+        ])
+    with tempfile.TemporaryDirectory() as td:
+        with _mock_ops(handler, td) as ops:
+            tree = ops.expand_comment("python", "abc", "focal", depth=2, limit=10)
+            assert_eq(tree.root.fullname, "t1_focal")
+            assert_eq(tree.root.body, "root comment")
+            assert_eq(len(tree.root.replies), 1)
+            assert_eq(tree.root.replies[0].fullname, "t1_reply1")
+            assert_eq(tree.root.replies[0].depth, 1)
+
+
+@test
+def test_ops_get_thread_budget_counts_nested():
+    """Round-8 fix: comment-budget charge must include nested replies, not
+    just top-level count. Otherwise threads with deep replies under-enforce
+    the workflow safety cap.
+    """
+    def handler(req):
+        return _thread_response(
+            _MIN_POST,
+            [{
+                "id": "c1", "body": "top", "author": "a", "score": 3,
+                "created_utc": 0, "parent_id": "t3_abc",
+                "replies": {"kind": "Listing", "data": {"children": [
+                    {"kind": "t1", "data": {
+                        "id": "r1", "body": "nested1", "author": "b",
+                        "score": 1, "created_utc": 0, "parent_id": "t1_c1",
+                    }},
+                    {"kind": "t1", "data": {
+                        "id": "r2", "body": "nested2", "author": "b",
+                        "score": 1, "created_utc": 0, "parent_id": "t1_c1",
+                    }},
+                ]}},
+            }],
+        )
+    with tempfile.TemporaryDirectory() as td:
+        budget = WorkflowBudget(max_api_calls=10, max_comments=100)
+        client = _mock_client(handler, budget=budget)
+        cache = Cache(Path(td) / "c.db")
+        with Operations(client=client, cache=cache) as ops:
+            ops.get_thread("abc")
+            assert_eq(budget.comments, 3,
+                      "must charge 1 top-level + 2 nested = 3, not just 1")
+
+
+@test
+def test_ops_negative_limit_rejected():
+    """Round-8 fix: defense-in-depth — Python API users bypass argparse."""
+    def handler(req):
+        return _listing_response([])
+    with tempfile.TemporaryDirectory() as td:
+        with _mock_ops(handler, td) as ops:
+            assert_raises(ValueError, ops.search, "x", subreddit="python", limit=0)
+            assert_raises(ValueError, ops.search, "x", subreddit="python", limit=-1)
+            assert_raises(ValueError, ops.get_subreddit_listing, "python", limit=0)
+            assert_raises(ValueError, ops.get_thread, "abc", top_n_comments=0)
+            assert_raises(ValueError, ops.get_thread, "abc", top_n_comments=-5)
+
+
+@test
+def test_ops_cache_write_failure_does_not_mask_transport():
+    """Round-7 fix: cache write failures must be best-effort; the original
+    transport exception (or success) must reach the caller unaltered.
+    """
+    class BrokenCache:
+        def get(self, *a, **kw): return None
+        def put(self, *a, **kw): raise RuntimeError("cache write boom")
+        def put_error(self, *a, **kw): raise RuntimeError("cache put_error boom")
+        def purge(self, **kw): return 0
+        def stats(self):
+            from reddit_research.core import CacheStats
+            return CacheStats()
+        def close(self): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+
+    # 200 path: cache.put fails — operation must still return the body
+    def handler200(req):
+        return _listing_response([_MIN_POST])
+    client = _mock_client(handler200)
+    try:
+        ops = Operations(client=client, cache=BrokenCache())
+        results = ops.search("foo", subreddit="python")
+        assert_eq(len(results), 1, "cache failure must not lose the fetched body")
+    finally:
+        client.close()
+
+    # 403 path: cache.put_error fails — original ForbiddenError must still propagate
+    def handler403(req):
+        return httpx.Response(403, json={"reason": "test", "message": "Forbidden"})
+    client = _mock_client(handler403)
+    try:
+        ops = Operations(client=client, cache=BrokenCache())
+        try:
+            ops.get_thread("zzzzzz")
+        except ForbiddenError as e:
+            assert_eq(e.reason, "test", "original error must reach caller")
+        else:
+            raise AssertionError("expected ForbiddenError")
+    finally:
+        client.close()
+
+
+@test
+def test_ops_parse_thread_strict_missing_post():
+    """Round-7 design: _parse_thread raises if the post element is missing."""
+    def handler(req):
+        # Simulates a malformed response — comment listing present but no post
+        return httpx.Response(200, json=[
+            {"kind": "Listing", "data": {"children": []}},  # no t3 post
+            {"kind": "Listing", "data": {"children": []}},
+        ])
+    with tempfile.TemporaryDirectory() as td:
+        with _mock_ops(handler, td) as ops:
+            assert_raises(ValueError, ops.get_thread, "abc")
+
+
+@test
+def test_ops_fresh_bypasses_cache():
+    """fresh=True forces a network call even when a valid cache entry exists."""
+    calls = [0]
+    def handler(req):
+        calls[0] += 1
+        return _listing_response([_MIN_POST])
+    with tempfile.TemporaryDirectory() as td:
+        with _mock_ops(handler, td) as ops:
+            ops.search("foo", subreddit="python")  # populates cache
+            ops.search("foo", subreddit="python")  # cache hit
+            ops.search("foo", subreddit="python", fresh=True)  # bypass cache
+            assert_eq(calls[0], 2, "fresh=True must trigger a 2nd network call")
+
+
+@test
+def test_ops_search_all_path_no_subreddit():
+    """search(subreddit=None) hits /search.json (search-all), not /r/<x>/search.json."""
+    seen_paths = []
+    def handler(req):
+        seen_paths.append(req.url.path)
+        return _listing_response([])
+    with tempfile.TemporaryDirectory() as td:
+        with _mock_ops(handler, td) as ops:
+            ops.search("foo")
+            assert_eq(seen_paths, ["/search.json"])
+
+
+# ---- CLI parser + dispatch ----------------------------------------------
+
+
+@test
+def test_cli_parser_rejects_negative_limit():
+    """Round-8 fix: --limit must reject 0/negative via argparse converter."""
+    from reddit_research.cli.__main__ import build_parser
+    parser = build_parser()
+    # argparse exits via SystemExit on bad args
+    assert_raises(SystemExit, parser.parse_args, ["search", "foo", "--limit", "0"])
+    assert_raises(SystemExit, parser.parse_args, ["search", "foo", "--limit", "-1"])
+
+
+@test
+def test_cli_parser_accepts_depth_zero():
+    """Round-8 fix: --depth allows 0 (focal comment only); help text says (0-5)."""
+    from reddit_research.cli.__main__ import build_parser
+    parser = build_parser()
+    args = parser.parse_args(["expand", "python", "abc", "xyz", "--depth", "0"])
+    assert_eq(args.depth, 0)
+
+
+@test
+def test_cli_run_catches_value_error():
+    """Round-8 fix: _run() must catch ValueError (parser strict / cap violation)
+    and return a clean exit code instead of raising a traceback."""
+    from reddit_research.cli.commands import _run
+    from argparse import Namespace
+
+    class FakeArgs(Namespace):
+        format = "text"
+        env_file = None
+        budget_api = 50
+        budget_comments = 500
+
+    def boom(ops, args):
+        raise ValueError("schema drift!")
+
+    code = _run(FakeArgs(), boom)
+    assert_eq(code, 1, "ValueError must map to exit code 1")
+
+
+@test
+def test_cli_run_catches_unexpected():
+    """Round-8 fix: bare `Exception` last-resort catch."""
+    from reddit_research.cli.commands import _run
+    from argparse import Namespace
+
+    class FakeArgs(Namespace):
+        format = "text"
+        env_file = None
+        budget_api = 50
+        budget_comments = 500
+
+    def boom(ops, args):
+        raise KeyError("totally unexpected")
+
+    code = _run(FakeArgs(), boom)
+    assert_eq(code, 1, "unexpected exception must still map to exit 1, not crash")
+
+
+@test
 def test_ops_status_snapshot():
     def handler(req):
         return _listing_response([_MIN_POST])
