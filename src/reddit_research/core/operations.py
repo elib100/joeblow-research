@@ -31,12 +31,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
 from reddit_research.core.cache import Cache, CacheStats
-from reddit_research.core.client import RedditJSONClient
+from reddit_research.core.client import RedditJSONClient, WorkflowBudget
 from reddit_research.core.config import Config
 from reddit_research.core.errors import (
     ForbiddenError,
@@ -142,12 +142,9 @@ class Operations:
     # ---- factory ----
 
     @classmethod
-    def from_config(cls, config: Config, *, budget: object | None = None) -> Operations:
+    def from_config(cls, config: Config, *, budget: WorkflowBudget | None = None) -> Operations:
         """Convenience: build a default-configured Operations from a Config."""
-        client = RedditJSONClient(
-            user_agent=config.user_agent,
-            budget=budget,  # type: ignore[arg-type]
-        )
+        client = RedditJSONClient(user_agent=config.user_agent, budget=budget)
         cache = Cache(config.cache_db_path)
         return cls(client=client, cache=cache)
 
@@ -201,8 +198,10 @@ class Operations:
                 "limit": int(limit),
             }
 
-        body = self._call_and_cache("search", key, path, params)
-        return _parse_listing_children(body)
+        return self._fetch_with_cache(
+            kind="search", key=key, path=path, params=params,
+            parse=_parse_listing_children,
+        )
 
     def get_subreddit_listing(
         self,
@@ -236,8 +235,10 @@ class Operations:
             params["t"] = time_filter
         path = f"/r/{name.lower()}/{sort}.json"
 
-        body = self._call_and_cache("listing", key, path, params)
-        return _parse_listing_children(body)
+        return self._fetch_with_cache(
+            kind="listing", key=key, path=path, params=params,
+            parse=_parse_listing_children,
+        )
 
     def get_thread(
         self,
@@ -270,8 +271,10 @@ class Operations:
         path = f"/comments/{bare}.json"
         params: dict[str, Any] = {"limit": int(top_n_comments)}
 
-        body = self._call_and_cache("thread", key, path, params)
-        thread = _parse_thread(body, top_n_comments)
+        thread = self._fetch_with_cache(
+            kind="thread", key=key, path=path, params=params,
+            parse=lambda body: _parse_thread(body, top_n_comments),
+        )
         # Charge comment budget after parsing. Round-8 panel: count includes
         # nested replies (Reddit's response packs replies inside top-level
         # comments — top_level_count alone undercounts what the LLM consumed).
@@ -324,8 +327,10 @@ class Operations:
         # Round-5 panel verified empirically.
         params: dict[str, Any] = {"limit": int(limit), "depth": int(depth), "context": 0}
 
-        body = self._call_and_cache("comment_subtree", key, path, params)
-        tree = _parse_comment_tree(body, focal_comment_id=bare_comment)
+        tree = self._fetch_with_cache(
+            kind="comment_subtree", key=key, path=path, params=params,
+            parse=lambda body: _parse_comment_tree(body, focal_comment_id=bare_comment),
+        )
         if self._client.budget is not None:
             # Count root + recursive replies
             self._client.budget.spend_comments(_count_comments(tree.root))
@@ -363,23 +368,26 @@ class Operations:
 
     # ---- internals ----
 
-    def _call_and_cache(
+    def _fetch_with_cache(
         self,
         kind: str,
         key: str,
         path: str,
         params: dict[str, Any],
+        parse: Callable[[Any], Any],
     ) -> Any:
-        """Issue a GET, cache result (200 → put, 403/404 → put_error), return body.
+        """Issue a GET, **parse first**, then cache only on parse success.
 
-        Cache writes are best-effort: a cache failure (disk full, schema
-        mismatch, etc.) is logged but never blocks the original transport
-        outcome from propagating to the caller. This is the round-7 panel
-        finding: caching is observability/optimization; it must not change
-        operation semantics.
+        Round-9 panel: the previous flow cached the body before the operation
+        parsed it, which meant a malformed 200 (Reddit schema drift, partial
+        response, etc.) would be persisted for the full TTL — only ``fresh=True``
+        could escape. This version parses first, so a bad 200 raises ``ValueError``
+        from the strict parser and the cache stays clean; the next call retries.
 
-        Transient errors (5xx, transport, redirect, budget-exceeded) are
-        re-raised without being cached.
+        Cache writes (success and error) are best-effort: a cache failure
+        (disk full, schema mismatch) is logged but never blocks the original
+        transport outcome from propagating. Transient errors (5xx, transport,
+        redirect, budget-exceeded) are re-raised without being cached.
         """
         try:
             body = self._client.get(path, params=params)
@@ -394,6 +402,9 @@ class Operations:
                     kind, key, cache_exc,
                 )
             raise
+        # Parse FIRST. If the body is malformed, the strict parser raises
+        # before we cache it — bad 200s never poison the cache.
+        parsed = parse(body)
         try:
             self._cache.put(kind, key, body, status_code=200)
         except Exception as cache_exc:
@@ -401,7 +412,7 @@ class Operations:
                 "cache.put failed for %s %s: %s",
                 kind, key, cache_exc,
             )
-        return body
+        return parsed
 
     def _raise_if_cached_error(self, hit, key: str) -> None:
         """If a cache hit holds a 403/404, replay the original error.

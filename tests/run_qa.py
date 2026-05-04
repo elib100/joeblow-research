@@ -643,6 +643,9 @@ def test_ops_get_thread_budget_counts_nested():
     """Round-8 fix: comment-budget charge must include nested replies, not
     just top-level count. Otherwise threads with deep replies under-enforce
     the workflow safety cap.
+
+    Round-9 strengthening: include a depth-2 grandchild to verify the
+    recursion goes all the way down, not just one level.
     """
     def handler(req):
         return _thread_response(
@@ -654,6 +657,13 @@ def test_ops_get_thread_budget_counts_nested():
                     {"kind": "t1", "data": {
                         "id": "r1", "body": "nested1", "author": "b",
                         "score": 1, "created_utc": 0, "parent_id": "t1_c1",
+                        # Grandchild — depth-2 recursion check
+                        "replies": {"kind": "Listing", "data": {"children": [
+                            {"kind": "t1", "data": {
+                                "id": "g1", "body": "grandchild", "author": "c",
+                                "score": 0, "created_utc": 0, "parent_id": "t1_r1",
+                            }},
+                        ]}},
                     }},
                     {"kind": "t1", "data": {
                         "id": "r2", "body": "nested2", "author": "b",
@@ -668,8 +678,9 @@ def test_ops_get_thread_budget_counts_nested():
         cache = Cache(Path(td) / "c.db")
         with Operations(client=client, cache=cache) as ops:
             ops.get_thread("abc")
-            assert_eq(budget.comments, 3,
-                      "must charge 1 top-level + 2 nested = 3, not just 1")
+            # 1 top-level + 2 children + 1 grandchild = 4
+            assert_eq(budget.comments, 4,
+                      "must count grandchild too: 1 top + 2 nested + 1 grand = 4")
 
 
 @test
@@ -831,6 +842,91 @@ def test_cli_run_catches_unexpected():
 
     code = _run(FakeArgs(), boom)
     assert_eq(code, 1, "unexpected exception must still map to exit 1, not crash")
+
+
+@test
+def test_ops_malformed_200_not_cached():
+    """Round-9 fix: a strict-parser failure must NOT cache the bad body.
+
+    Previously cache.put ran before the operations layer parsed the body, so
+    a malformed 200 (Reddit schema drift) would be persisted for the full
+    TTL — only fresh=True could escape. Now parse runs first; if it raises,
+    the cache stays clean and the next call retries the network.
+    """
+    calls = [0]
+
+    def handler(req):
+        calls[0] += 1
+        # Return a malformed 200 — missing data.children, _parse_listing_children raises
+        return httpx.Response(200, json={"kind": "Listing", "data": {}})
+
+    with tempfile.TemporaryDirectory() as td:
+        with _mock_ops(handler, td) as ops:
+            assert_raises(ValueError, ops.search, "foo", subreddit="python")
+            # Critical: second call must NOT hit the cache. The bad body must
+            # not have been persisted.
+            assert_raises(ValueError, ops.search, "foo", subreddit="python")
+            assert_eq(calls[0], 2,
+                      "malformed 200 must not poison cache; second call must retry network")
+
+
+@test
+def test_client_budget_not_charged_on_proactive_backoff_raise():
+    """Round-9 fix: when proactive backoff raises (reset > cap), the budget
+    must NOT be charged — no upstream request went out.
+    """
+    # Build a client whose headroom indicates remaining=0 and reset way beyond cap
+    def handler(req):
+        # Should never be called — proactive backoff raises first
+        return httpx.Response(200, json={"ok": True})
+
+    b = WorkflowBudget(max_api_calls=10, max_comments=100)
+    client = _mock_client(handler, budget=b)
+    try:
+        # Seed headroom: remaining=0, reset way beyond MAX_RETRY_AFTER_SECONDS
+        # (120s). Use 1000s. Set reset_at_monotonic directly to bypass the
+        # initial "first call has no headroom" check.
+        client.headroom = {
+            "used": 100.0,
+            "remaining": 0.0,
+            "reset_in_seconds": 1000.0,
+            "reset_at_monotonic": time.monotonic() + 1000.0,
+            "reset_raw": "1000",
+        }
+        try:
+            client.get("/r/python/hot.json")
+        except RateLimitError:
+            pass
+        else:
+            raise AssertionError("expected RateLimitError from proactive backoff")
+        # The actual request never went out; budget must show 0 charges
+        assert_eq(b.api_calls, 0,
+                  "proactive-backoff raise must NOT charge api_calls budget")
+    finally:
+        client.close()
+
+
+@test
+def test_client_budget_charges_per_attempt_on_429_retry():
+    """Round-9 fix: each network attempt is a separate budget charge.
+    A 429 → retry → 429 sequence should charge twice (Reddit saw 2 requests).
+    """
+    def handler(req):
+        return httpx.Response(429, json={"message": "rate limited"},
+                              headers={"Retry-After": "0"})
+
+    b = WorkflowBudget(max_api_calls=10, max_comments=100)
+    client = _mock_client(handler, budget=b)
+    try:
+        try:
+            client.get("/x")
+        except RateLimitError:
+            pass
+        # Initial attempt + 1 retry = 2 charges
+        assert_eq(b.api_calls, 2,
+                  "429 retry must charge twice (2 actual network attempts)")
+    finally:
+        client.close()
 
 
 @test

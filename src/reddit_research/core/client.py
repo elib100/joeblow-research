@@ -135,28 +135,36 @@ class RedditJSONClient:
         :class:`TransportError` on network failure. 429 is honored with up to
         :data:`MAX_429_RETRIES` retry pass(es) using ``Retry-After``.
 
-        Budget semantics (per the round-6 panel review): one ``get()`` call
-        counts as one budget unit regardless of internal retries — i.e.
-        "logical operation," not "actual upstream call". DNS/connect failures
-        before the retry loop also consume a budget unit; this is acceptable
-        because exhausting budget on transport errors is a correct signal that
-        something's wrong, and the failure cap (50 by default) is large enough
-        that the cost is bounded.
+        Budget semantics (round-9 panel): ``spend_api_call()`` is charged
+        per *actual network attempt* — once per ``httpx.get()`` invocation,
+        AFTER ``_proactive_backoff()`` clears. This means:
 
-        Note: this isn't backwards-compatible with the spike's
-        ``(body, status)`` return tuple — at the library level, raising on
-        non-2xx is more idiomatic.
+        - Cache hits at the operations layer never reach this method, so they
+          never charge.
+        - Proactive backoff that raises (reset > cap) → 0 charge (no request
+          went out).
+        - One successful network call → 1 charge.
+        - One success after a 429 retry → 2 charges (Reddit saw 2 requests).
+        - Transport failure → 1 charge (the attempt happened).
+
+        This matches the "budget = upstream cost as Reddit sees it" framing.
+
+        Not backwards-compatible with the spike's ``(body, status)`` tuple —
+        at the library level, raising on non-2xx is more idiomatic.
         """
-        if self.budget is not None:
-            self.budget.spend_api_call()
-
         # Proactive backoff: if last response showed remaining < threshold,
-        # sleep until reset. (First call has no prior headroom; we sail in.)
+        # sleep until reset (or raise RateLimitError if reset > cap).
+        # No budget charge here — no request has gone out yet.
         self._proactive_backoff()
 
         attempts_left = 1 + MAX_429_RETRIES
         while True:
             attempts_left -= 1
+            # Charge per actual attempt, not per logical operation. Round-9
+            # panel: previously charged before backoff, which meant the budget
+            # could be charged for zero upstream calls.
+            if self.budget is not None:
+                self.budget.spend_api_call()
             try:
                 r = self._client.get(path, params=params)
             except httpx.HTTPError as e:
@@ -193,8 +201,9 @@ class RedditJSONClient:
                     wait,
                 )
                 time.sleep(wait + 0.5)  # safety margin
-                # Don't re-spend a budget API-call unit for the retry — it's
-                # the same logical operation.
+                # The retry charges its own spend_api_call() at the top of
+                # the loop — Reddit sees a separate request, the budget
+                # reflects that.
                 continue
 
             raise exc
