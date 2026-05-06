@@ -1,13 +1,13 @@
 # Handoff — reddit_research
 
-**Updated:** 2026-04-27
-**Status:** design v4. **Pivoted to Reddit's public `.json` endpoints as primary transport.** Spike is runnable now — no Reddit account, no OAuth, no API approval needed. Reddit API access request still pending (submitted earlier today) but no longer on the critical path.
+**Updated:** 2026-05-05
+**Status:** **v0.1.0 tagged + deployed.** Released on GitHub at <https://github.com/elib100/joeblow-research/releases/tag/v0.1.0>; production install live on warehouse-vm under `redditmcp` user. Panel-cleared through 9 review rounds (Codex / Gemini / Opus). 51/51 unit tests + live smoke test passing.
 
 ## TL;DR
 
-Personal Reddit research tool — a Python library + CLI + (later) MCP server that lets an LLM search Reddit and pull threads/comments efficiently for summarization. Single user, deployed on warehouse-vm. Hard isolation from Motroco data.
+Personal Reddit research tool — Python library + CLI (v0.1.0 done). MCP server adapter is the next major addition. Single user, deployed on warehouse-vm. Hard isolation from Motroco data.
 
-**Major architectural change today:** moved from OAuth + PRAW (which is gated behind Reddit's Responsible Builder Policy approval, with low approval rates for personal projects) to the unauthenticated `.json` endpoints (which work today, expose rate-limit headers cleanly, and are structurally read-only). OAuth becomes a future upgrade path for higher rate limits / write capability if Reddit ever grants access.
+Transport is Reddit's public `.json` endpoints (no OAuth, no PRAW). Reddit's Responsible Builder Policy gates traditional API access; the `.json` path sidesteps that, exposes rate-limit headers cleanly, and is structurally read-only. OAuth remains a documented future upgrade path if Reddit grants access (form was submitted 2026-04-27, still pending).
 
 ## Where to look
 
@@ -24,41 +24,35 @@ Personal Reddit research tool — a Python library + CLI + (later) MCP server th
 
 ## What's been done
 
-1. Scoped the project (single-user research tool, read-only).
-2. Scraped the Reddit OAuth API spec into `docs/reddit-api-inventory.json` — kept as reference for the deferred OAuth upgrade.
-3. Designed cache + rate-limit + deployment + security model.
-4. Sent design through three rounds of multi-model panel review (Codex / Gemini / Opus).
-5. Discovered Reddit's Responsible Builder Policy (Nov 2025) blocks self-service script-app creation. Submitted API access form anyway.
-6. Published source repo at <https://github.com/elib100/joeblow-research>.
-7. **Probed Reddit's `.json` public endpoints — verified working in 2026 across every shape we need.**
-8. **Pivoted primary transport to `.json`** (httpx, no OAuth, no PRAW). Spike rewritten accordingly.
+1. Design through 9 multi-model panel review rounds.
+2. Pivoted from OAuth + PRAW to httpx + Reddit's public `.json` transport (sidesteps Responsible Builder Policy gate, structurally read-only, exposes rate-limit headers cleanly).
+3. Phase 0 spike against the live API: confirmed transport works, mapped error responses (bogus thread IDs return 403 not 404; r/lounge returns 403 with `reason="gold_only"`), pagination cursor works, `/api/morechildren.json` works, signal-to-noise ratio in comment responses is ~10% (so v0.2 markdown preprocessor has ~10× token leverage).
+4. Built v0.1: pyproject + core (errors / config / keys / client / cache / operations) + cli (argparse adapter) + tests (51 unit tests + live smoke). 51/51 passing.
+5. Tagged v0.1.0. Pushed to GitHub.
+6. **Deployed to warehouse-vm under `redditmcp` user (2026-05-05).** `/home/redditmcp/reddit-research/source/` (cloned at v0.1.0), `/home/redditmcp/reddit-research/venv/` (with the package installed editable), `/home/redditmcp/reddit-cache/` (mode 0700) holding `.env` (mode 0600) + `cache.db` (mode 0600). `reddit-cli` console script verified working.
+7. Reddit API access request still pending from the 2026-04-27 form submission; no longer blocking anything.
 
-## What's next (Phase 0 spike, ~30 min, runnable now)
+## What's next (v0.2 candidates, in recommended priority order)
 
-The spike script (`phase0_spike.py`) targets the `.json` transport and runs all four probes:
+1. **MCP server adapter** (~250 lines) — exposes the six operations as MCP tools so Claude can drive the research workflow natively. Biggest single-step value increase. Built on the existing core; nothing new to design.
+2. **Markdown preprocessor** (~200 lines) — strips Reddit's ~90% operational metadata, formats comment trees as depth-indented markdown for LLM consumption. Phase 0 measured ~10× token leverage on the most expensive paths. Particularly valuable once MCP usage starts burning tokens on raw JSON.
+3. **Snapshots / delta-over-time research** — if a research workflow ever wants to track how a thread evolves. Not currently needed.
+4. **Write capability behind flag** — depends on Reddit OAuth access (form pending). Until granted, defer.
+5. **Async (httpx async)** — single-user has no parallelism need. YAGNI.
 
-1. Connectivity — UA accepted, headroom headers populated.
-2. Error mapping — 404 / 403 (with structured `reason`) distinguishable.
-3. `MoreComments` cap — `/api/morechildren.json` with capped child list.
-4. Benchmark queries — five realistic queries, three paths each (`list_only`, `list_plus_threads_top20`, `list_plus_threads_plus_expand_one`), with real tokenizer counts and signal-to-noise ratio.
+## Operating notes for production
 
-Setup + run:
-
-```bash
-cd /home/elib/code/reddit_api
-python3 -m venv venv && source venv/bin/activate
-pip install -r requirements-phase0.txt
-cp .env.example .env
-python phase0_spike.py
-```
-
-The `.env` only has `REDDIT_USER_AGENT` worth setting (defaults to `reddit-research:0.1 (by /u/joeblowfromidaho)` if unset). No secrets needed.
-
-Outputs: `phase0_notes.md`, `phase0_benchmarks.md`, `phase0_benchmarks.json`. All gitignored.
-
-## What's deferred
-
-MCP server adapter, preprocessed views, OAuth + PRAW transport (only relevant if Reddit grants the API access request), write capability, audit log, async, snapshots, multi-account, age-aware TTL.
+- Update flow on warehouse-vm:
+  ```bash
+  sudo -u redditmcp -H bash -c '
+    cd ~/reddit-research/source
+    git fetch --tags
+    git checkout vX.Y.Z   # or main for unreleased
+    ~/reddit-research/venv/bin/pip install -e .
+  '
+  ```
+- Smoke test post-deploy: `sudo -u redditmcp -H ~/reddit-research/venv/bin/python ~/reddit-research/source/tests/smoke_test.py`
+- `reddit-cli` console script is at `/home/redditmcp/reddit-research/venv/bin/reddit-cli`. Not in `redditmcp`'s PATH unless venv is activated; for ad-hoc calls use that absolute path or `sudo -u redditmcp -H bash -c 'source ~/reddit-research/venv/bin/activate && reddit-cli ...'`.
 
 ## Operating constraints to respect
 
