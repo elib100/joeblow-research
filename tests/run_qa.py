@@ -946,6 +946,306 @@ def test_ops_status_snapshot():
             assert_(s.cache_writes >= 1)
 
 
+# ---- MCP server adapter --------------------------------------------------
+#
+# The MCP layer is a thin glue over Operations. These tests verify:
+#   - tool wrappers return the structured `{ok, result}` envelope on success
+#   - typed Reddit errors map to structured `{ok: false, error: {...}}` (not
+#     raised — raising would surface as MCP isError, hiding the discriminator
+#     fields the LLM needs)
+#   - the budget reset path works and respects the no-budget case
+#
+# Invoking through `server._tool_manager.call_tool()` returns the raw dict
+# (FastMCP's outer `call_tool()` wraps it in serialized ContentBlocks; for
+# unit tests we want the un-serialized payload).
+
+
+def _call_mcp_tool(server, tool_name, **tool_args):
+    """Invoke an MCP tool by name and return its raw return value.
+
+    Goes through the tool manager rather than the public ``call_tool`` so
+    we get back the dict the tool function actually returned, not the
+    transport-layer ContentBlock wrapping. Uses ``tool_name`` rather than
+    ``name`` so it doesn't collide with the ``name`` argument that
+    ``get_subreddit_listing`` takes.
+    """
+    import asyncio
+    return asyncio.run(server._tool_manager.call_tool(tool_name, tool_args))
+
+
+def _build_mcp_server(handler, db_dir, budget=None):
+    """Wire an MCP server on top of a mocked-HTTP Operations.
+
+    Returns ``(server, ops, budget)`` so the test can clean up ``ops`` and
+    inspect ``budget`` after the call.
+    """
+    from reddit_research.mcp.server import build_server
+    client = _mock_client(handler, budget=budget)
+    cache = Cache(Path(db_dir) / "c.db")
+    ops = Operations(client=client, cache=cache)
+    server = build_server(ops, budget=budget)
+    return server, ops, budget
+
+
+@test
+def test_mcp_search_happy_path():
+    def handler(req):
+        return _listing_response([_MIN_POST])
+    with tempfile.TemporaryDirectory() as td:
+        server, ops, _ = _build_mcp_server(handler, td)
+        try:
+            out = _call_mcp_tool(server, "search", query="foo", subreddit="python")
+            assert_eq(out["ok"], True)
+            results = out["result"]
+            assert_eq(len(results), 1)
+            assert_eq(results[0]["fullname"], "t3_abc")
+            # Round of paranoia: tuple-of-comments etc must serialize to lists,
+            # not "(...,)" stringification.
+            assert_(isinstance(results, list),
+                    f"result must be a list, got {type(results).__name__}")
+        finally:
+            ops.close()
+
+
+@test
+def test_mcp_not_found_returns_structured_error():
+    """Round of MCP-design: 404 must NOT raise — the LLM needs the
+    discriminator fields to decide what to do next."""
+    def handler(req):
+        return httpx.Response(404, json={"message": "Not Found", "error": 404})
+    with tempfile.TemporaryDirectory() as td:
+        server, ops, _ = _build_mcp_server(handler, td)
+        try:
+            out = _call_mcp_tool(server, "get_thread", thread_id="zzzzzz")
+            assert_eq(out["ok"], False)
+            assert_eq(out["error"]["type"], "not_found")
+            assert_(out["error"]["path"].startswith("/comments/"),
+                    f"path should be the URL, got {out['error']['path']!r}")
+        finally:
+            ops.close()
+
+
+@test
+def test_mcp_forbidden_preserves_reason():
+    """Round of MCP-design: 403 reason field is the only discriminator
+    between gold-only / private / banned / quarantined; LLM needs it."""
+    def handler(req):
+        return httpx.Response(403, json={"reason": "gold_only", "message": "Forbidden"})
+    with tempfile.TemporaryDirectory() as td:
+        server, ops, _ = _build_mcp_server(handler, td)
+        try:
+            out = _call_mcp_tool(server, "get_subreddit_listing", name="lounge")
+            assert_eq(out["ok"], False)
+            assert_eq(out["error"]["type"], "forbidden")
+            assert_eq(out["error"]["reason"], "gold_only")
+        finally:
+            ops.close()
+
+
+@test
+def test_mcp_budget_exceeded_returns_structured():
+    """BudgetExceededError → {error: {type: budget_exceeded, kind, used, cap}}."""
+    def handler(req):
+        return _listing_response([_MIN_POST])
+    with tempfile.TemporaryDirectory() as td:
+        budget = WorkflowBudget(max_api_calls=1, max_comments=100)
+        server, ops, _ = _build_mcp_server(handler, td, budget=budget)
+        try:
+            # Burn the 1-call budget on a fresh search
+            out1 = _call_mcp_tool(server, "search", query="foo", subreddit="python")
+            assert_eq(out1["ok"], True)
+            # Second fresh search trips the budget on the second api call
+            out2 = _call_mcp_tool(server, "search",
+                                  query="bar", subreddit="python", fresh=True)
+            assert_eq(out2["ok"], False)
+            assert_eq(out2["error"]["type"], "budget_exceeded")
+            assert_eq(out2["error"]["kind"], "api_calls")
+            assert_eq(out2["error"]["cap"], 1)
+        finally:
+            ops.close()
+
+
+@test
+def test_mcp_invalid_id_returns_structured():
+    """A bare-but-malformed id (uppercase) must come back as invalid_id, not raise."""
+    def handler(req):
+        # Should never be reached — validation happens before HTTP
+        return _thread_response(_MIN_POST, [])
+    with tempfile.TemporaryDirectory() as td:
+        server, ops, _ = _build_mcp_server(handler, td)
+        try:
+            out = _call_mcp_tool(server, "get_thread", thread_id="ABC123")
+            assert_eq(out["ok"], False)
+            assert_eq(out["error"]["type"], "invalid_id")
+        finally:
+            ops.close()
+
+
+@test
+def test_mcp_caps_violation_maps_to_invalid_input():
+    """expand_comment depth>5 raises ValueError in core; MCP layer wraps."""
+    def handler(req):
+        return httpx.Response(200, json=[])
+    with tempfile.TemporaryDirectory() as td:
+        server, ops, _ = _build_mcp_server(handler, td)
+        try:
+            out = _call_mcp_tool(
+                server, "expand_comment",
+                subreddit="x", thread_id="abc", comment_id="xyz", depth=10,
+            )
+            assert_eq(out["ok"], False)
+            assert_eq(out["error"]["type"], "invalid_input")
+        finally:
+            ops.close()
+
+
+@test
+def test_mcp_reset_budget_zeroes_counters():
+    def handler(req):
+        return _listing_response([_MIN_POST])
+    with tempfile.TemporaryDirectory() as td:
+        budget = WorkflowBudget(max_api_calls=10, max_comments=100)
+        server, ops, _ = _build_mcp_server(handler, td, budget=budget)
+        try:
+            _call_mcp_tool(server, "search", query="foo", subreddit="python")
+            assert_eq(budget.api_calls, 1)
+            out = _call_mcp_tool(server, "reset_budget")
+            assert_eq(out["ok"], True)
+            assert_eq(out["result"]["api_calls"], 0)
+            assert_eq(budget.api_calls, 0, "underlying budget must be zeroed")
+            # Caps unchanged
+            assert_eq(budget.max_api_calls, 10)
+        finally:
+            ops.close()
+
+
+@test
+def test_mcp_reset_budget_when_none_returns_structured_error():
+    def handler(req):
+        return _listing_response([])
+    with tempfile.TemporaryDirectory() as td:
+        # No budget passed in
+        server, ops, _ = _build_mcp_server(handler, td, budget=None)
+        try:
+            out = _call_mcp_tool(server, "reset_budget")
+            assert_eq(out["ok"], False)
+            assert_eq(out["error"]["type"], "no_budget_configured")
+        finally:
+            ops.close()
+
+
+@test
+def test_mcp_status_serializes_dataclass():
+    """Status is a dataclass — must come back as a plain dict for the LLM."""
+    def handler(req):
+        return _listing_response([_MIN_POST])
+    with tempfile.TemporaryDirectory() as td:
+        budget = WorkflowBudget(max_api_calls=10, max_comments=100)
+        server, ops, _ = _build_mcp_server(handler, td, budget=budget)
+        try:
+            _call_mcp_tool(server, "search", query="foo", subreddit="python")
+            out = _call_mcp_tool(server, "status")
+            assert_eq(out["ok"], True)
+            s = out["result"]
+            assert_(isinstance(s, dict),
+                    f"Status must serialize to dict, got {type(s).__name__}")
+            assert_eq(s["total_api_calls"], 1)
+            assert_(s["workflow_budget"] is not None)
+            assert_eq(s["workflow_budget"]["api_calls"], 1)
+        finally:
+            ops.close()
+
+
+@test
+def test_mcp_thread_serializes_nested_replies_as_lists():
+    """Comment.replies is a tuple in the dataclass; must come back as a list."""
+    def handler(req):
+        return _thread_response(
+            _MIN_POST,
+            [{
+                "id": "c1", "body": "top", "author": "a", "score": 3,
+                "created_utc": 0, "parent_id": "t3_abc",
+                "replies": {"kind": "Listing", "data": {"children": [
+                    {"kind": "t1", "data": {
+                        "id": "r1", "body": "nested", "author": "b",
+                        "score": 1, "created_utc": 0, "parent_id": "t1_c1",
+                    }},
+                ]}},
+            }],
+        )
+    with tempfile.TemporaryDirectory() as td:
+        server, ops, _ = _build_mcp_server(handler, td)
+        try:
+            out = _call_mcp_tool(server, "get_thread", thread_id="abc")
+            assert_eq(out["ok"], True)
+            comments = out["result"]["comments"]
+            assert_(isinstance(comments, list))
+            replies = comments[0]["replies"]
+            assert_(isinstance(replies, list),
+                    f"replies must be list, got {type(replies).__name__}")
+            assert_eq(replies[0]["fullname"], "t1_r1")
+        finally:
+            ops.close()
+
+
+@test
+def test_mcp_purge_returns_count():
+    def handler(req):
+        return _listing_response([])
+    with tempfile.TemporaryDirectory() as td:
+        server, ops, _ = _build_mcp_server(handler, td)
+        try:
+            out = _call_mcp_tool(server, "purge", older_than_days=30)
+            assert_eq(out["ok"], True)
+            assert_eq(out["result"]["older_than_days"], 30)
+            assert_eq(out["result"]["deleted_rows"], 0)
+        finally:
+            ops.close()
+
+
+@test
+def test_mcp_all_tools_registered():
+    """The server must expose all six core ops + reset_budget. If we add
+    or rename a tool, this test should be the canary."""
+    def handler(req):
+        return _listing_response([])
+    with tempfile.TemporaryDirectory() as td:
+        server, ops, _ = _build_mcp_server(handler, td)
+        try:
+            import asyncio
+            tools = asyncio.run(server.list_tools())
+            names = sorted(t.name for t in tools)
+            expected = sorted([
+                "search", "get_subreddit_listing", "get_thread",
+                "expand_comment", "purge", "status", "reset_budget",
+            ])
+            assert_eq(names, expected, f"tool surface drifted: {names}")
+        finally:
+            ops.close()
+
+
+@test
+def test_mcp_budget_reset_helper_directly():
+    """Round-9-equivalent: WorkflowBudget.reset() is a one-call zeroing.
+    Catches accidental cap-clobbering or off-by-one bugs that would let an
+    LLM ostensibly reset and then immediately blow the cap on the next call."""
+    b = WorkflowBudget(max_api_calls=5, max_comments=50)
+    b.spend_api_call()
+    b.spend_comments(20)
+    assert_eq(b.api_calls, 1)
+    assert_eq(b.comments, 20)
+    b.reset()
+    assert_eq(b.api_calls, 0)
+    assert_eq(b.comments, 0)
+    # Caps preserved
+    assert_eq(b.max_api_calls, 5)
+    assert_eq(b.max_comments, 50)
+    # Should be able to spend again up to the cap
+    for _ in range(5):
+        b.spend_api_call()
+    assert_raises(BudgetExceededError, b.spend_api_call)
+
+
 # ---- Run ----------------------------------------------------------------
 
 

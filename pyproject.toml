@@ -30,9 +30,13 @@ dependencies = [
 dev = [
     "tiktoken>=0.5",
 ]
+mcp = [
+    "mcp>=1.27",
+]
 
 [project.scripts]
 reddit-cli = "reddit_research.cli.__main__:main"
+reddit-mcp = "reddit_research.mcp.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/elib100/joeblow-research"

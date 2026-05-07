@@ -101,6 +101,17 @@ class WorkflowBudget:
             "max_comments": self.max_comments,
         }
 
+    def reset(self) -> None:
+        """Zero out spent api_calls / comments. Caps are unchanged.
+
+        Used by the MCP ``reset_budget`` tool when the LLM starts a new
+        logical research run within the same server session. Caps stay
+        whatever they were configured to at startup; this only clears
+        consumption.
+        """
+        self.api_calls = 0
+        self.comments = 0
+
 
 # ---- Client ---------------------------------------------------------------
 
