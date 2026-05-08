@@ -175,9 +175,21 @@ class Cache:
     def purge(self, older_than_seconds: int, *, now: int | None = None) -> int:
         """Delete rows whose ``fetched_at`` is older than ``older_than_seconds``.
         Returns the number of rows deleted.
+
+        Round-10 panel (Gemini P1): ``older_than_seconds`` must be
+        non-negative. A negative value pushes ``cutoff`` past ``now``,
+        and ``WHERE fetched_at < cutoff`` then matches every row —
+        silently wiping the cache. The CLI's argparse already guards
+        this; the MCP layer and any direct caller did not. Fixing here
+        gives both adapters the same protection.
         """
+        seconds = int(older_than_seconds)
+        if seconds < 0:
+            raise ValueError(
+                f"older_than_seconds must be >= 0; got {seconds}"
+            )
         now_ts = int(time.time()) if now is None else int(now)
-        cutoff = now_ts - int(older_than_seconds)
+        cutoff = now_ts - seconds
         cur = self._connect().execute(
             "DELETE FROM cached_objects WHERE fetched_at < ?",
             (cutoff,),

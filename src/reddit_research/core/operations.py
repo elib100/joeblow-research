@@ -58,6 +58,13 @@ from reddit_research.core.keys import (
 EXPAND_DEPTH_MAX = 5
 EXPAND_LIMIT_MAX = 50
 
+# Round-10 panel (Gemini P2): tool descriptions advertise 1-100 limits for
+# search / listing / thread; core was only enforcing the lower bound. Reddit
+# silently truncates above 100 anyway, so cap matches that to avoid a budget-
+# burning fan-out + closes the doc/code gap.
+LISTING_LIMIT_MAX = 100
+THREAD_TOP_N_MAX = 100
+
 
 # ---- Result types ---------------------------------------------------------
 
@@ -171,8 +178,10 @@ class Operations:
         fresh: bool = False,
     ) -> list[ThreadSummary]:
         """Search Reddit. ``subreddit=None`` means search-all."""
-        if limit < 1:
-            raise ValueError(f"limit must be >= 1; got {limit}")
+        if limit < 1 or limit > LISTING_LIMIT_MAX:
+            raise ValueError(
+                f"limit must be in [1, {LISTING_LIMIT_MAX}]; got {limit}"
+            )
         key = search_key(query, subreddit, sort, time_filter, limit)
         if not fresh:
             hit = self._cache.get("search", key)
@@ -219,8 +228,10 @@ class Operations:
         AND the cache key for irrelevant sorts so two callers spelling the
         same query differently collide on one entry (round-7 panel).
         """
-        if limit < 1:
-            raise ValueError(f"limit must be >= 1; got {limit}")
+        if limit < 1 or limit > LISTING_LIMIT_MAX:
+            raise ValueError(
+                f"limit must be in [1, {LISTING_LIMIT_MAX}]; got {limit}"
+            )
         sort_uses_time = sort in ("top", "controversial")
         effective_time_filter = time_filter if sort_uses_time else None
         key = listing_key(name, sort, limit, effective_time_filter)
@@ -257,8 +268,11 @@ class Operations:
         comments outside Reddit's first-N window. Caller can sort the
         returned ``comments`` tuple if a specific order is needed.
         """
-        if top_n_comments < 1:
-            raise ValueError(f"top_n_comments must be >= 1; got {top_n_comments}")
+        if top_n_comments < 1 or top_n_comments > THREAD_TOP_N_MAX:
+            raise ValueError(
+                f"top_n_comments must be in [1, {THREAD_TOP_N_MAX}]; "
+                f"got {top_n_comments}"
+            )
         key = thread_key(thread_id, top_n_comments)
         bare = validate_id_or_fullname(thread_id)
 

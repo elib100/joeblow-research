@@ -27,15 +27,17 @@ are not the LLM's problem.
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict, is_dataclass
-from typing import Any
+from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 from reddit_research import __version__ as PKG_VERSION
+from reddit_research._serialize import to_jsonable
 from reddit_research.core import (
     BudgetExceededError,
     ForbiddenError,
+    HTTPError,
     InvalidIdError,
     NotFoundError,
     Operations,
@@ -66,23 +68,8 @@ SERVER_INSTRUCTIONS = (
 # ---- Result-shape helpers -------------------------------------------------
 
 
-def _to_jsonable(payload: Any) -> Any:
-    """Recursively convert dataclasses / tuples to plain JSON-able values.
-
-    Mirrors :func:`reddit_research.cli.commands._to_jsonable` so the MCP and
-    CLI output shapes stay identical for consumers that target both.
-    """
-    if is_dataclass(payload) and not isinstance(payload, type):
-        return _to_jsonable(asdict(payload))
-    if isinstance(payload, (list, tuple)):
-        return [_to_jsonable(x) for x in payload]
-    if isinstance(payload, dict):
-        return {k: _to_jsonable(v) for k, v in payload.items()}
-    return payload
-
-
 def _ok(payload: Any) -> dict:
-    return {"ok": True, "result": _to_jsonable(payload)}
+    return {"ok": True, "result": to_jsonable(payload)}
 
 
 def _err(error_type: str, **fields: Any) -> dict:
@@ -96,7 +83,7 @@ def _err(error_type: str, **fields: Any) -> dict:
     return {"ok": False, "error": {"type": error_type, **fields}}
 
 
-def _wrap_reddit_call(label: str, fn, *args, **kwargs) -> dict:
+def _wrap_reddit_call(fn, *args, **kwargs) -> dict:
     """Run a core operation and translate typed errors into structured dicts.
 
     Pure programmer / infrastructure failures (RuntimeError from cache
@@ -104,6 +91,13 @@ def _wrap_reddit_call(label: str, fn, *args, **kwargs) -> dict:
     them as MCP-level isError responses — those aren't the LLM's problem
     and a structured ``ok: false`` would make them invisible to the host
     operator.
+
+    Round-10 panel (Opus P2-2): catches generic ``HTTPError`` last so
+    statuses outside the 3xx/403/404/429/5xx mapping (400 / 401 / 402 /
+    405 / 418 etc.) still surface structured to the LLM with the status
+    code preserved, instead of escaping as MCP isError. Reddit's ``.json``
+    transport doesn't return these today, but if its edge changes the
+    failure stays informative.
     """
     try:
         result = fn(*args, **kwargs)
@@ -151,6 +145,17 @@ def _wrap_reddit_call(label: str, fn, *args, **kwargs) -> dict:
         )
     except InvalidIdError as e:
         return _err("invalid_id", message=str(e))
+    except HTTPError as e:
+        # Catch-all for unmapped statuses. Must come AFTER the specific
+        # subclasses above (HTTPError is their base class). Preserves the
+        # status code so the LLM can branch on it.
+        return _err(
+            "http_error",
+            status=e.status,
+            path=e.path,
+            reason=e.reason,
+            message=e.message or str(e),
+        )
     except ValueError as e:
         # Strict parsers (Reddit schema drift) and operation-layer cap
         # validators (depth/limit/top_n out of range) both raise ValueError.
@@ -201,11 +206,10 @@ def build_server(
         subreddit: str | None = None,
         sort: str = "relevance",
         time_filter: str = "all",
-        limit: int = 25,
+        limit: Annotated[int, Field(ge=1, le=100)] = 25,
         fresh: bool = False,
     ) -> dict:
         return _wrap_reddit_call(
-            "search",
             ops.search,
             query=query,
             subreddit=subreddit,
@@ -226,12 +230,11 @@ def build_server(
     def get_subreddit_listing(
         name: str,
         sort: str = "hot",
-        limit: int = 25,
+        limit: Annotated[int, Field(ge=1, le=100)] = 25,
         time_filter: str = "all",
         fresh: bool = False,
     ) -> dict:
         return _wrap_reddit_call(
-            "get_subreddit_listing",
             ops.get_subreddit_listing,
             name=name,
             sort=sort,
@@ -254,11 +257,10 @@ def build_server(
     )
     def get_thread(
         thread_id: str,
-        top_n_comments: int = 20,
+        top_n_comments: Annotated[int, Field(ge=1, le=100)] = 20,
         fresh: bool = False,
     ) -> dict:
         return _wrap_reddit_call(
-            "get_thread",
             ops.get_thread,
             thread_id=thread_id,
             top_n_comments=top_n_comments,
@@ -278,12 +280,11 @@ def build_server(
         subreddit: str,
         thread_id: str,
         comment_id: str,
-        depth: int = 2,
-        limit: int = 20,
+        depth: Annotated[int, Field(ge=0, le=5)] = 2,
+        limit: Annotated[int, Field(ge=1, le=50)] = 20,
         fresh: bool = False,
     ) -> dict:
         return _wrap_reddit_call(
-            "expand_comment",
             ops.expand_comment,
             subreddit=subreddit,
             thread_id=thread_id,
@@ -300,7 +301,10 @@ def build_server(
             "call any time."
         )
     )
-    def purge(older_than_days: int = 30) -> dict:
+    def purge(older_than_days: Annotated[int, Field(ge=0)] = 30) -> dict:
+        # Round-10 panel (Gemini P1): ge=0 in the schema gives hosts the
+        # fail-fast signal; the underlying Cache.purge enforces the same
+        # bound at runtime so direct callers (CLI, library) get parity.
         try:
             deleted = ops.purge(older_than_days=older_than_days)
         except ValueError as e:
@@ -316,7 +320,7 @@ def build_server(
         )
     )
     def status() -> dict:
-        return _wrap_reddit_call("status", ops.status)
+        return _wrap_reddit_call(ops.status)
 
     @mcp.tool(
         description=(

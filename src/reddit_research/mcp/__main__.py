@@ -21,7 +21,20 @@ from reddit_research.core import (
     RedditJSONClient,
     load_config,
 )
-from reddit_research.mcp.server import make_default_budget, serve
+
+# Round-10 panel (Codex P1): the `mcp` SDK is an optional extra. The
+# console script always installs, so an `import reddit_research.mcp.server`
+# at module top would raise ModuleNotFoundError on plain installs and
+# leave the user with no actionable message. Defer the import and surface
+# a clean stderr install hint instead.
+try:
+    from reddit_research.mcp.server import make_default_budget, serve
+except ImportError as _mcp_import_error:  # pragma: no cover — exercised in __main__
+    make_default_budget = None  # type: ignore[assignment]
+    serve = None  # type: ignore[assignment]
+    _MCP_IMPORT_ERROR: ImportError | None = _mcp_import_error
+else:
+    _MCP_IMPORT_ERROR = None
 
 
 def _positive_int(s: str) -> int:
@@ -60,6 +73,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if _MCP_IMPORT_ERROR is not None:
+        # Plain install (no `[mcp]` extra). Don't trip a stack trace —
+        # tell the user how to fix it and exit non-zero.
+        print(
+            "reddit-mcp: the `mcp` SDK is not installed.\n"
+            "  Install with:  pip install 'reddit-research[mcp]'\n"
+            f"  Underlying error: {_MCP_IMPORT_ERROR}",
+            file=sys.stderr,
+        )
+        return 1
+
     args = build_parser().parse_args(argv)
     if args.verbose:
         # IMPORTANT: stderr only. Stdout is the MCP transport channel — any

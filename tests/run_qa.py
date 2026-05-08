@@ -1082,19 +1082,36 @@ def test_mcp_invalid_id_returns_structured():
 
 
 @test
-def test_mcp_caps_violation_maps_to_invalid_input():
-    """expand_comment depth>5 raises ValueError in core; MCP layer wraps."""
+def test_mcp_caps_rejected_by_schema():
+    """Round-10 panel: depth/limit bounds are encoded in the tool schema
+    via ``Annotated[int, Field(ge=..., le=...)]``. FastMCP's pydantic
+    validator rejects out-of-range args BEFORE they reach the wrapper, so
+    well-behaved hosts fail-fast on schema validation rather than getting
+    a structured ``invalid_input`` envelope.
+
+    Core-side runtime validation still protects direct Python callers
+    (covered by ``test_ops_expand_comment_caps``); this test confirms the
+    MCP-side schema gate is wired up.
+    """
+    from mcp.server.fastmcp.exceptions import ToolError
     def handler(req):
         return httpx.Response(200, json=[])
     with tempfile.TemporaryDirectory() as td:
         server, ops, _ = _build_mcp_server(handler, td)
         try:
-            out = _call_mcp_tool(
-                server, "expand_comment",
-                subreddit="x", thread_id="abc", comment_id="xyz", depth=10,
-            )
-            assert_eq(out["ok"], False)
-            assert_eq(out["error"]["type"], "invalid_input")
+            try:
+                _call_mcp_tool(
+                    server, "expand_comment",
+                    subreddit="x", thread_id="abc", comment_id="xyz", depth=10,
+                )
+            except ToolError as e:
+                assert_("depth" in str(e), f"error must mention depth: {e}")
+                assert_("less_than_equal" in str(e) or "5" in str(e),
+                        f"error must indicate the bound: {e}")
+            else:
+                raise AssertionError(
+                    "expected ToolError from schema validation when depth=10"
+                )
         finally:
             ops.close()
 
@@ -1222,6 +1239,139 @@ def test_mcp_all_tools_registered():
             assert_eq(names, expected, f"tool surface drifted: {names}")
         finally:
             ops.close()
+
+
+@test
+def test_mcp_rate_limit_error_envelope():
+    """Round-10 (Opus P2-1, Codex P2): the rate_limited envelope renames
+    ``e.retry_after`` to ``retry_after_seconds``. A typo on either side
+    silently breaks the contract the LLM-side code branches on. Hit it
+    with a real 429 response so MAX_429_RETRIES=1 retry exhausts.
+    """
+    def handler(req):
+        return httpx.Response(
+            429, json={"message": "rate limited"},
+            headers={"Retry-After": "30"},
+        )
+    with tempfile.TemporaryDirectory() as td:
+        server, ops, _ = _build_mcp_server(handler, td)
+        try:
+            out = _call_mcp_tool(server, "get_subreddit_listing", name="python")
+            assert_eq(out["ok"], False)
+            assert_eq(out["error"]["type"], "rate_limited")
+            assert_eq(out["error"]["retry_after_seconds"], 30.0,
+                      "field name must be retry_after_seconds, not retry_after")
+            assert_("path" in out["error"])
+        finally:
+            ops.close()
+
+
+@test
+def test_mcp_redirect_error_envelope():
+    """Round-10 (Opus P2-1): RedirectError exposes ``location``."""
+    def handler(req):
+        return httpx.Response(302, headers={"Location": "/elsewhere"})
+    with tempfile.TemporaryDirectory() as td:
+        server, ops, _ = _build_mcp_server(handler, td)
+        try:
+            out = _call_mcp_tool(server, "get_subreddit_listing", name="python")
+            assert_eq(out["ok"], False)
+            assert_eq(out["error"]["type"], "redirect")
+            assert_eq(out["error"]["location"], "/elsewhere")
+        finally:
+            ops.close()
+
+
+@test
+def test_mcp_upstream_error_envelope():
+    """Round-10 (Opus P2-1): 5xx → upstream_error (not raised)."""
+    def handler(req):
+        return httpx.Response(503, text="Service Unavailable")
+    with tempfile.TemporaryDirectory() as td:
+        server, ops, _ = _build_mcp_server(handler, td)
+        try:
+            out = _call_mcp_tool(server, "get_subreddit_listing", name="python")
+            assert_eq(out["ok"], False)
+            assert_eq(out["error"]["type"], "upstream_error")
+            assert_("message" in out["error"])
+        finally:
+            ops.close()
+
+
+@test
+def test_mcp_transport_error_envelope():
+    """Round-10 (Opus P2-1): a transport-level failure (httpx exception)
+    becomes a structured ``transport_error`` envelope, not raised.
+    """
+    def handler(req):
+        # httpx.MockTransport handlers can raise to simulate transport failure
+        raise httpx.ConnectError("simulated network failure")
+    with tempfile.TemporaryDirectory() as td:
+        server, ops, _ = _build_mcp_server(handler, td)
+        try:
+            out = _call_mcp_tool(server, "get_subreddit_listing", name="python")
+            assert_eq(out["ok"], False)
+            assert_eq(out["error"]["type"], "transport_error")
+        finally:
+            ops.close()
+
+
+@test
+def test_mcp_parser_strict_value_error_envelope():
+    """Round-10 (Opus P2-1, Codex P2): a malformed 200 (Reddit schema
+    drift) makes the strict parser raise ValueError; the wrapper maps it
+    to ``invalid_input``. Important: this is the path that previously
+    cached bad bodies for full TTL (round-9 fix); we want to verify the
+    LLM still gets a structured error rather than an MCP isError.
+    """
+    def handler(req):
+        return httpx.Response(200, json={"kind": "Listing", "data": {}})
+    with tempfile.TemporaryDirectory() as td:
+        server, ops, _ = _build_mcp_server(handler, td)
+        try:
+            out = _call_mcp_tool(server, "search", query="foo", subreddit="python")
+            assert_eq(out["ok"], False)
+            assert_eq(out["error"]["type"], "invalid_input")
+            assert_("data.children" in out["error"]["message"]
+                    or "schema" in out["error"]["message"].lower(),
+                    f"message should hint at schema drift: {out['error']['message']!r}")
+        finally:
+            ops.close()
+
+
+@test
+def test_mcp_unknown_http_status_envelope():
+    """Round-10 (Opus P2-2): a Reddit response with a status code outside
+    the known mapping (e.g. 418) must come back as a structured
+    ``http_error`` envelope with the status preserved, not as an
+    unhandled exception.
+    """
+    def handler(req):
+        return httpx.Response(418, json={"message": "I'm a teapot"})
+    with tempfile.TemporaryDirectory() as td:
+        server, ops, _ = _build_mcp_server(handler, td)
+        try:
+            out = _call_mcp_tool(server, "get_subreddit_listing", name="python")
+            assert_eq(out["ok"], False)
+            assert_eq(out["error"]["type"], "http_error")
+            assert_eq(out["error"]["status"], 418,
+                      "status code must be preserved on the envelope")
+        finally:
+            ops.close()
+
+
+@test
+def test_mcp_purge_negative_via_core_validation():
+    """Round-10 (Gemini P1): older_than_days < 0 used to wipe the cache
+    (cutoff went past now). Cache.purge now raises ValueError; the MCP
+    purge tool catches it and maps to invalid_input. Schema also enforces
+    ge=0, but the runtime guard is the universal fix that protects
+    library callers too.
+    """
+    # Direct: Cache.purge guard
+    with tempfile.TemporaryDirectory() as td:
+        with Cache(Path(td) / "c.db") as cache:
+            assert_raises(ValueError, cache.purge, older_than_seconds=-1)
 
 
 @test

@@ -19,9 +19,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import asdict, is_dataclass
 from typing import Any, Callable
 
+from reddit_research._serialize import to_jsonable
 from reddit_research.core import (
     BudgetExceededError,
     Cache,
@@ -164,19 +164,9 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def _emit(args: argparse.Namespace, payload: Any) -> None:
     if args.format == "json":
-        print(json.dumps(_to_jsonable(payload), indent=2, default=str))
+        print(json.dumps(to_jsonable(payload), indent=2, default=str))
     else:
         _emit_text(payload)
-
-
-def _to_jsonable(payload: Any) -> Any:
-    if is_dataclass(payload) and not isinstance(payload, type):
-        return asdict(payload)
-    if isinstance(payload, list):
-        return [_to_jsonable(x) for x in payload]
-    if isinstance(payload, dict):
-        return {k: _to_jsonable(v) for k, v in payload.items()}
-    return payload
 
 
 def _emit_text(payload: Any) -> None:
