@@ -4,9 +4,10 @@
     "name": "reddit_research",
     "package_name_tentative": "reddit_research",
     "purpose": "Personal Reddit research tool. Single user (Eli's developer account). The use case is: search subreddits for important / useful information for an LLM to summarize.",
-    "status": "v0.1.0 tagged + deployed on warehouse-vm 2026-05-05. Panel-cleared through 9 multi-model rounds (Codex/Gemini/Opus). 51/51 unit tests + live smoke passing. Repo at https://github.com/elib100/joeblow-research/releases/tag/v0.1.0; production install under redditmcp user at /home/redditmcp/reddit-research/. Next: v0.2 MCP server adapter, then markdown preprocessor (Phase 0 measured ~10x token leverage). Reddit API access form pending from 2026-04-27, no longer blocking.",
+    "status": "v0.1.0 tagged + deployed on warehouse-vm 2026-05-05. v0.2 chunk 1 (MCP stdio server adapter) merged on main 2026-05-07/08, panel-cleared (round 10: Codex/Gemini/Opus all approve after fixes). 71/71 unit tests + live JSON-RPC handshake verified. Repo at https://github.com/elib100/joeblow-research; production install under redditmcp user at /home/redditmcp/reddit-research/ still on v0.1.0 (not yet pulled to v0.2). Next: v0.2 chunk 2 markdown preprocessor (Phase 0 measured ~10x token leverage), then production pull. Reddit API access form pending from 2026-04-27, no longer blocking.",
     "version": "0.1.0",
-    "plan_version": 4,
+    "next_version_in_progress": "0.2.0-dev",
+    "plan_version": 5,
     "host": "warehouse-vm",
     "source_dir": "/home/elib/code/reddit_api/",
     "category": "personal-tool",
@@ -29,7 +30,12 @@
     { "id": 13, "topic": "error_caching_split", "choice": "403/404 cached 24h, 5xx never cached", "rationale": "Permanent vs transient. Caching 5xx would poison after one Reddit blip." },
     { "id": 14, "topic": "fullname_validation_in_core", "choice": "validate ^t[1-6]_[a-z0-9]+$ in core, not at MCP boundary", "rationale": "CLI gets the same protection as MCP. Cheap." },
     { "id": 15, "topic": "rate_limit_observability", "choice": "read X-Ratelimit-* on every response; back off proactively at <10% remaining; honor 429 Retry-After", "rationale": ".json transport exposes the headers cleanly, which removes the PRAW-hides-them problem. Manual backoff is straightforward when headroom is visible." },
-    { "id": 16, "topic": "expand_comment_endpoint", "choice": "single dedicated call to /r/<sub>/comments/<thread>/_/<comment>.json (depth/limit params)", "rationale": "Cleaner than tracking 'more' markers + /api/morechildren — one HTTP call returns the comment with its full reply subtree in context. Matches MCP-friendly 'follow this comment' semantics." }
+    { "id": 16, "topic": "expand_comment_endpoint", "choice": "single dedicated call to /r/<sub>/comments/<thread>/_/<comment>.json (depth/limit params)", "rationale": "Cleaner than tracking 'more' markers + /api/morechildren — one HTTP call returns the comment with its full reply subtree in context. Matches MCP-friendly 'follow this comment' semantics." },
+    { "id": 17, "topic": "mcp_sdk_choice", "choice": "official `mcp` Python SDK (FastMCP) over hand-rolled JSON-RPC", "rationale": "MCP protocol surface (initialize / tools/list / tools/call / shutdown / capabilities) is a moving target with discovery semantics and JSON-schema conventions. FastMCP owns it; we own the Reddit logic. Optional dependency (installed via `[mcp]` extra) so plain CLI installs stay light." },
+    { "id": 18, "topic": "mcp_error_envelope", "choice": "Reddit-domain errors return as structured `{ok: false, error: {type, ...}}` dicts; only programmer / infrastructure failures raise (and become MCP `isError: true`)", "rationale": "Raising surfaces as `isError: true` on the CallToolResult, which loses the discriminator fields (reason, retry_after, kind/used/cap, status) that the LLM needs to decide what to do next. Round-10 panel agreed unanimously this is the right split." },
+    { "id": 19, "topic": "mcp_session_budget", "choice": "one WorkflowBudget per stdio process; LLM-callable `reset_budget` tool zeros consumption (caps unchanged)", "rationale": "CLAUDE.md ## Rate-limit-discipline says 'per-session for the MCP server'. The host process exit is the session boundary; `reset_budget` is the LLM's escape hatch for new logical research runs within one session. Round-10 Codex flagged this as a self-bypassable guardrail; declined for single-user pragma — the alternative (server restart) is operationally costly." },
+    { "id": 20, "topic": "mcp_optional_dependency_gating", "choice": "lazy-import `mcp` SDK in `mcp/__main__.py`; print friendly install hint and exit 1 if missing. `mcp/__init__.py` does NOT eagerly re-export from `server.py`.", "rationale": "Round-10 Codex P1: an unconditional eager import from `__init__.py` crashed plain installs (without the `[mcp]` extra) on `import reddit_research.mcp`. Lazy-import gives the user `pip install 'reddit-research[mcp]'` instead of a stack trace." },
+    { "id": 21, "topic": "mcp_schema_bounds_via_pydantic", "choice": "encode numeric bounds in MCP tool argument schemas via `Annotated[int, Field(ge=..., le=...)]`; keep core-side runtime validation as the backstop", "rationale": "Hosts that respect schemas fail-fast on out-of-range args (depth>5, limit>100 etc.). Core validation still protects direct Python callers (CLI, library). Round-10 Codex+Gemini agreed." }
   ],
 
   "operations": [
@@ -147,9 +153,20 @@
     "transport_lockout_risk": "Reddit could block unauthenticated .json access at any time without warning. Mitigation: design core/client.py so transport is swappable; OAuth (when granted) is the slot-in replacement."
   },
 
+  "mcp_server": {
+    "status": "v0.2 chunk 1 merged on main 2026-05-08, panel-cleared (round 10), not yet deployed to production",
+    "transport": "stdio only — no network listener; remote access via `ssh warehouse reddit-mcp`",
+    "sdk": "official `mcp` Python SDK (FastMCP), v1.27+",
+    "install": "pip install -e '.[mcp]' (the `[mcp]` extra)",
+    "entry_point": "reddit-mcp console script → reddit_research.mcp.__main__:main",
+    "tools_exposed": ["search", "get_subreddit_listing", "get_thread", "expand_comment", "purge", "status", "reset_budget"],
+    "error_envelope": "Reddit-domain errors return as `{ok: false, error: {type, ...}}` with discriminator fields (reason / retry_after_seconds / path / kind+used+cap / status). Error types: budget_exceeded, rate_limited, not_found, forbidden, redirect, transport_error, upstream_error, http_error (catch-all for unmapped statuses), invalid_id, invalid_input, no_budget_configured. Programmer/infra errors raise → MCP `isError: true`.",
+    "schema_bounds": "depth (0-5), expand_comment.limit (1-50), search/listing/thread limit (1-100), purge.older_than_days (>= 0) — encoded in pydantic Field annotations on tool params; core enforces same bounds at runtime as backstop for direct callers.",
+    "session_lifecycle": "one Operations + one WorkflowBudget per stdio process lifetime. reset_budget tool zeros consumption (caps unchanged) for new logical research runs without restarting the host process."
+  },
+
   "deferred_to_v0_2_or_later": [
-    "MCP server adapter",
-    "preprocessed views (markdown transforms for token savings)",
+    "preprocessed views (markdown transforms for token savings) — v0.2 chunk 2",
     "OAuth + PRAW transport (only adds value if Reddit grants access — for higher rate limits or write capability)",
     "write capability (depends on OAuth)",
     "audit log for writes",
@@ -212,6 +229,34 @@
         "PRAGMA synchronous=NORMAL explicit",
         "Documented Reddit-policy-change as hardening trigger"
       ]
+    },
+    {
+      "round": 10,
+      "date": "2026-05-08",
+      "scope": "v0.2 chunk 1: MCP stdio server adapter (commit 419810e)",
+      "models": ["Codex (gpt-5.4)", "Gemini", "Claude Opus 4.6"],
+      "verdicts": { "codex": "BLOCK", "gemini": "APPROVE-WITH-FIXES", "opus": "APPROVE" },
+      "blockers_found": 2,
+      "blockers": [
+        "Codex P1: optional-dep / unconditional surface mismatch — `mcp` SDK in `[mcp]` extra but `reddit-mcp` script + `mcp/__init__.py` re-export installed unconditionally; plain installs crashed on `import reddit_research.mcp`.",
+        "Gemini P1: Cache.purge(older_than_seconds=-1) made cutoff > now, so `WHERE fetched_at < cutoff` matched every row — silent total cache wipe. CLI argparse was the only guard."
+      ],
+      "blockers_resolution": "commit 2cef169. (1) Drop eager re-export in mcp/__init__.py; mcp/__main__.py lazy-imports server module and prints `pip install 'reddit-research[mcp]'` install hint with exit 1 when SDK missing. Verified in clean venv. (2) Cache.purge raises ValueError on negative input; MCP `purge` tool encodes ge=0 in pydantic schema for fail-fast, catches the runtime ValueError as `invalid_input` envelope.",
+      "blockers_declined": [
+        "Gemini P1.2: WorkflowBudget thread-safety (TOCTOU on api_calls += 1). Verified at mcp/server/fastmcp/utilities/func_metadata.py:95 — sync tools dispatch directly in the async event loop, no to_thread. Stdio is single-stream serial; no race. Adding a Lock would be premature for hypothetical future requirements."
+      ],
+      "should_fix_applied": [
+        "Add HTTPError catch-all in _wrap_reddit_call: unmapped statuses (400/401/418/etc.) become structured `http_error` envelopes with status preserved instead of escaping as MCP isError (Opus P2).",
+        "Encode numeric bounds in MCP tool schemas via `Annotated[int, Field(ge=..., le=...)]` (Codex+Gemini P2).",
+        "Enforce upper bounds (1-100) on search/listing/get_thread limits in core (Gemini P2). Reddit silently truncates above 100 anyway; closes prose-vs-code contract gap.",
+        "Drop unused `label` argument from `_wrap_reddit_call` (Gemini P2).",
+        "Extract shared `_to_jsonable` to `reddit_research._serialize.to_jsonable` so CLI and MCP can't drift on serialization shape (Gemini P2).",
+        "Six new tests for previously-uncovered error-envelope branches: rate_limited (with retry_after_seconds rename), redirect (location), upstream_error (5xx), transport_error (httpx exception), parser-strict ValueError (Reddit schema drift), unknown-status http_error envelope. Plus cache.purge negative guard. (Opus+Codex P2)"
+      ],
+      "should_fix_declined": [
+        "Codex P2: gate `reset_budget` behind a startup flag or remove from tool surface. Declined per single-user pragma — the budget is a per-research-run guardrail by design, restarting the server for legitimate multi-run sessions is operationally costly.",
+        "Gemini P2-3: split parser-strict ValueError vs cap-violation ValueError into distinct envelope types. Declined — message disambiguates; adding a SchemaError class is more churn than payoff."
+      ]
     }
   ],
 
@@ -240,7 +285,10 @@
     { "date": "2026-05-03", "topic": "v0.1 CLI + tests", "outcome": "Wrote cli/__main__ + cli/commands (argparse adapter for the six operations + two output formats + typed-exception → exit-code mapping). Wrote tests/run_qa.py (37 unit tests with mocked HTTP + tmpdir SQLite) and tests/smoke_test.py (live one-shot)." },
     { "date": "2026-05-04", "topic": "Round 8 panel review", "outcome": "Found 1 P1 (get_thread comment-budget undercount on nested replies) + 4 P2 (CLI _run not catching ValueError/RuntimeError, --depth help mismatch, missing positive-int validation, missing happy-path expand_comment test). All applied. Suite expanded to 48 tests." },
     { "date": "2026-05-04", "topic": "Round 9 panel review (final pre-tag)", "outcome": "Codex blocked on 2 P1: bad 200s cached before parsing (could poison cache for full TTL on Reddit schema drift), and budget charged before _proactive_backoff (could charge with zero upstream call). Both applied: _call_and_cache replaced with _fetch_with_cache (parses first, caches only on success); spend_api_call moved into the retry loop after backoff (charges per actual httpx attempt). Opus + Gemini approved without changes. Suite expanded to 51 tests." },
-    { "date": "2026-05-05", "topic": "v0.1.0 tagged + deployed", "outcome": "Tagged v0.1.0 on commit 4f5da6f, pushed to GitHub. Deployed to warehouse-vm under newly-created redditmcp service user (UID 1005). Source at /home/redditmcp/reddit-research/source/ (cloned + checked out v0.1.0); venv at /home/redditmcp/reddit-research/venv/ (editable install of the package); data dir at /home/redditmcp/reddit-cache/ (mode 0700) with .env (mode 0600, REDDIT_USER_AGENT + REDDIT_CACHE_DIR set, no secrets needed for .json transport) and cache.db (mode 0600). reddit-cli console script verified working in production layout." }
+    { "date": "2026-05-05", "topic": "v0.1.0 tagged + deployed", "outcome": "Tagged v0.1.0 on commit 4f5da6f, pushed to GitHub. Deployed to warehouse-vm under newly-created redditmcp service user (UID 1005). Source at /home/redditmcp/reddit-research/source/ (cloned + checked out v0.1.0); venv at /home/redditmcp/reddit-research/venv/ (editable install of the package); data dir at /home/redditmcp/reddit-cache/ (mode 0700) with .env (mode 0600, REDDIT_USER_AGENT + REDDIT_CACHE_DIR set, no secrets needed for .json transport) and cache.db (mode 0600). reddit-cli console script verified working in production layout." },
+    { "date": "2026-05-07", "topic": "v0.2 chunk 1: MCP stdio server adapter", "outcome": "Wrote src/reddit_research/mcp/ (~360 lines): __init__.py, server.py (FastMCP `build_server(ops, budget)` + 7 tool wrappers — search, get_subreddit_listing, get_thread, expand_comment, purge, status, reset_budget), __main__.py (entry point owning Operations lifecycle, argparse for budget overrides). Added WorkflowBudget.reset() to core. Reddit-domain errors come back as structured `{ok: false, error: {type, ...}}` envelopes (NotFound/Forbidden/RateLimit/Redirect/Transport/Upstream/InvalidId/ValueError); programmer errors raise. Tools share one Operations + WorkflowBudget for the stdio session lifetime. mcp>=1.27 added as `[mcp]` optional extra; `reddit-mcp` console script entry. 13 new MCP tests (51→64 passing). Live JSON-RPC handshake against `reddit-mcp` verified end-to-end (initialize + tools/list)." },
+    { "date": "2026-05-08", "topic": "Round 10 panel review", "outcome": "Codex BLOCK / Gemini APPROVE-WITH-FIXES / Opus APPROVE. Two P1s applied: (1) lazy-import `mcp` SDK with friendly install hint (Codex — eager import broke plain installs without `[mcp]` extra), (2) Cache.purge(older_than_seconds<0) now raises ValueError (Gemini — negative input was wiping the entire cache by pushing cutoff past now). Declined Gemini P1.2 (WorkflowBudget thread safety) — verified FastMCP dispatches sync tools serially in the async loop (mcp/server/fastmcp/utilities/func_metadata.py:95, no to_thread). Six P2s applied: HTTPError catch-all for unmapped statuses, schema-encoded bounds via Annotated/Field, upper-bound on search/listing/thread limits, drop unused `label` arg, extract shared `_to_jsonable`, six new error-envelope tests. Declined Codex P2 on `reset_budget` gating per single-user pragma. Suite 64→71 passing. Commit 2cef169 pushed." },
+    { "date": "2026-05-08", "topic": "Reddit edge 403 on smoke", "outcome": "Smoke test hit a Reddit-side 403 (HTML block page from varnish, not JSON; `via: 1.1 varnish`). Same UA had worked earlier the same day. Likely an IP-level edge throttle from cumulative volume during round-10 panel CLIs + repeated smoke tests. Not a code regression — diff did not touch transport layer. Will re-verify in production after warehouse-vm pulls v0.2." }
   ],
 
   "open_questions": [],
@@ -282,7 +330,7 @@
 
   "metadata": {
     "manifest_version": 1,
-    "last_updated": "2026-04-27",
+    "last_updated": "2026-05-08",
     "updater_responsibility": "Whoever changes design (CLAUDE.md edits, new operations, schema bumps, panel reviews) must also update this manifest in the same change. Don't let the two drift."
   }
 }

@@ -1,11 +1,11 @@
 # Handoff — reddit_research
 
-**Updated:** 2026-05-05
-**Status:** **v0.1.0 tagged + deployed.** Released on GitHub at <https://github.com/elib100/joeblow-research/releases/tag/v0.1.0>; production install live on warehouse-vm under `redditmcp` user. Panel-cleared through 9 review rounds (Codex / Gemini / Opus). 51/51 unit tests + live smoke test passing.
+**Updated:** 2026-05-08
+**Status:** **v0.2 chunk 1 (MCP server adapter) merged on `main`, panel-cleared (round 10).** v0.1.0 still the current release tag. 71/71 unit tests passing. Production on warehouse-vm still on v0.1.0 — not yet pulled to v0.2. Markdown preprocessor (chunk 2) is next.
 
 ## TL;DR
 
-Personal Reddit research tool — Python library + CLI (v0.1.0 done). MCP server adapter is the next major addition. Single user, deployed on warehouse-vm. Hard isolation from Motroco data.
+Personal Reddit research tool — Python library + CLI (v0.1.0 released) + MCP stdio server (v0.2 chunk 1, on `main`). Single user, deployed on warehouse-vm. Hard isolation from Motroco data.
 
 Transport is Reddit's public `.json` endpoints (no OAuth, no PRAW). Reddit's Responsible Builder Policy gates traditional API access; the `.json` path sidesteps that, exposes rate-limit headers cleanly, and is structurally read-only. OAuth remains a documented future upgrade path if Reddit grants access (form was submitted 2026-04-27, still pending).
 
@@ -31,11 +31,12 @@ Transport is Reddit's public `.json` endpoints (no OAuth, no PRAW). Reddit's Res
 5. Tagged v0.1.0. Pushed to GitHub.
 6. **Deployed to warehouse-vm under `redditmcp` user (2026-05-05).** `/home/redditmcp/reddit-research/source/` (cloned at v0.1.0), `/home/redditmcp/reddit-research/venv/` (with the package installed editable), `/home/redditmcp/reddit-cache/` (mode 0700) holding `.env` (mode 0600) + `cache.db` (mode 0600). `reddit-cli` console script verified working.
 7. Reddit API access request still pending from the 2026-04-27 form submission; no longer blocking anything.
+8. **v0.2 chunk 1: MCP server adapter shipped (2026-05-07/08, commits `419810e` + `2cef169`).** FastMCP-based stdio server exposing the 6 core ops + `reset_budget` as MCP tools. Round-10 panel review (Codex BLOCK → APPROVE after fixes / Gemini APPROVE-WITH-FIXES → APPROVE / Opus APPROVE). 13 new MCP tests; suite is 71/71. Live JSON-RPC handshake verified. `mcp` SDK installed via `[mcp]` extra; lazy-imported with friendly install hint when missing.
 
 ## What's next (v0.2 candidates, in recommended priority order)
 
-1. **MCP server adapter** (~250 lines) — exposes the six operations as MCP tools so Claude can drive the research workflow natively. Biggest single-step value increase. Built on the existing core; nothing new to design.
-2. **Markdown preprocessor** (~200 lines) — strips Reddit's ~90% operational metadata, formats comment trees as depth-indented markdown for LLM consumption. Phase 0 measured ~10× token leverage on the most expensive paths. Particularly valuable once MCP usage starts burning tokens on raw JSON.
+1. **Markdown preprocessor** (~200 lines) — strips Reddit's ~90% operational metadata, formats comment trees as depth-indented markdown for LLM consumption. Phase 0 measured ~10× token leverage on the most expensive paths. Particularly valuable now that MCP is shipped and starts burning tokens on raw JSON.
+2. **Pull v0.2 chunk 1 to production on warehouse-vm.** Run the standard update flow under `redditmcp`, then verify with the live JSON-RPC handshake. Production is still on v0.1.0; the MCP server isn't accessible via `ssh warehouse reddit-mcp` yet. Will need `pip install -e '.[mcp]'` (note the extra) to install the SDK on the production venv.
 3. **Snapshots / delta-over-time research** — if a research workflow ever wants to track how a thread evolves. Not currently needed.
 4. **Write capability behind flag** — depends on Reddit OAuth access (form pending). Until granted, defer.
 5. **Async (httpx async)** — single-user has no parallelism need. YAGNI.
@@ -48,11 +49,19 @@ Transport is Reddit's public `.json` endpoints (no OAuth, no PRAW). Reddit's Res
     cd ~/reddit-research/source
     git fetch --tags
     git checkout vX.Y.Z   # or main for unreleased
-    ~/reddit-research/venv/bin/pip install -e .
+    ~/reddit-research/venv/bin/pip install -e ".[mcp]"   # include MCP extra
   '
   ```
+  The `[mcp]` extra was added in v0.2 chunk 1 — without it, `reddit-mcp` exits 1 with a clear "install with `pip install 'reddit-research[mcp]'`" hint, but works fine. The CLI `reddit-cli` does not need it.
 - Smoke test post-deploy: `sudo -u redditmcp -H ~/reddit-research/venv/bin/python ~/reddit-research/source/tests/smoke_test.py`
-- `reddit-cli` console script is at `/home/redditmcp/reddit-research/venv/bin/reddit-cli`. Not in `redditmcp`'s PATH unless venv is activated; for ad-hoc calls use that absolute path or `sudo -u redditmcp -H bash -c 'source ~/reddit-research/venv/bin/activate && reddit-cli ...'`.
+- MCP handshake post-deploy:
+  ```bash
+  sudo -u redditmcp -H bash -c '
+    echo "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"smoke\",\"version\":\"0\"}}}" | ~/reddit-research/venv/bin/reddit-mcp
+  '
+  ```
+  Should return `serverInfo: {"name":"reddit-research","version":"<pkg>"}` plus the tool list.
+- `reddit-cli` and `reddit-mcp` console scripts are at `/home/redditmcp/reddit-research/venv/bin/`. Not in `redditmcp`'s PATH unless venv is activated; for ad-hoc calls use the absolute path or `sudo -u redditmcp -H bash -c 'source ~/reddit-research/venv/bin/activate && reddit-cli ...'`.
 
 ## Operating constraints to respect
 
