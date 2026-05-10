@@ -29,9 +29,10 @@ What we strip:
 
 **User content vs. renderer structure** (round-11 panel, Codex P1):
 A naive "embed body inline" approach lets a hostile or merely-mistaken
-Reddit user spoof renderer markup. A comment body containing
-``- **[999]** attacker · \`t1_fake\`: payload`` would render at the
-same indentation as a real reply, and because backticked fullnames are
+Reddit user spoof renderer markup. A comment body that mimics the
+renderer's bullet shape — like ``- **[999]** attacker`` followed by a
+backticked ``t1_fake`` and a payload — would render at the same
+indentation as a real reply, and because backticked fullnames are
 load-bearing for follow-up tool calls (``expand_comment``,
 ``get_thread``), an LLM consumer could be tricked into calling tools
 on attacker-chosen IDs. The fix is structural: all user-authored body
@@ -40,6 +41,13 @@ blockquotes (``> `` prefix). User markup stays inside the blockquote
 namespace; renderer-emitted bullets, headings, and separators stay
 outside. The LLM-visible rule: "anything inside ``>`` came from a
 Reddit user; anything outside came from this renderer."
+
+**Titles get the same treatment via :func:`_escape_title`** (round-12
+panel, Codex P1): titles render outside the blockquote namespace
+(H1 + listing link text), so they need character-level escaping rather
+than structural quoting. Backticks become ``\\``` so title text can't
+emit fake fullname handles, and line-break characters collapse to
+space so the H1 line stays one line.
 
 Why this isn't in ``core/``: same reason as ``_serialize.py`` — core
 is "no UI/adapter deps". This is presentation transform; CLI and MCP
@@ -272,16 +280,36 @@ def _author(raw: str | None) -> str:
 
 
 def _escape_title(title: str) -> str:
-    """Escape characters that would break inline markdown link text.
+    """Escape characters that would let user-authored title text spoof
+    renderer-emitted markdown structure.
 
-    Specifically: brackets ``[ ]`` and pipe ``|`` (the latter only
-    matters inside tables, which we don't emit, but cheap to guard).
-    Pipes also confuse some renderers when they appear next to bullet
-    delimiters. Backslash-escape these.
+    Titles are user content, but unlike body/selftext they render
+    OUTSIDE the blockquote namespace — at H1 level in
+    :func:`thread_to_markdown` and as link text in listings. Round-12
+    panel (Codex P1): without escaping, a title like ``Inspect `t1_fake```
+    emits an unquoted backticked fullname at root, which the LLM will
+    treat as a legitimate tool-call handle because backticked
+    fullnames are how this renderer marks real handles. Worse, a title
+    containing a literal newline (defensive — Reddit *should* strip
+    these, but trusting that is a circular argument) could break the
+    H1 line and emit fake bullets / headings at root.
+
+    Escapes:
+      - ``\\``  → ``\\\\``  (must come first so subsequent escapes
+        don't double-encode the leading slash)
+      - ``[`` ``]`` ``|``  — link-text and table delimiters, escaped
+        even though we don't emit tables (cheap defense in depth)
+      - `` ` ``  → ``\\` `` — neutralizes code-span / fullname spoofing
+      - ``\\r``, ``\\n``, ``\\v``, ``\\f``  → space — collapses any line-
+        break-shaped character to a space so the title stays a single
+        line in H1 and link contexts. ``str.splitlines()`` defines this
+        set; using the same set keeps the policy explicit.
     """
-    return (
-        title.replace("\\", "\\\\")
-        .replace("[", "\\[")
-        .replace("]", "\\]")
-        .replace("|", "\\|")
-    )
+    out = title.replace("\\", "\\\\")
+    for ch in ("[", "]", "|", "`"):
+        out = out.replace(ch, "\\" + ch)
+    # Collapse all line-break characters to a single space. Titles are
+    # one-line constructs in markdown.
+    for ch in ("\r", "\n", "\v", "\f"):
+        out = out.replace(ch, " ")
+    return out
