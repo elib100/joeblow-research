@@ -249,7 +249,8 @@ def build_server(
             "Fetch a subreddit listing — hot|new|top|rising|controversial. "
             "limit: 1-100, default 25. time_filter only applies to top "
             "and controversial; ignored otherwise. Returns thread summaries "
-            "in Reddit's order."
+            "in Reddit's order. format='markdown' for the compact bullet "
+            "view (~10x cheaper in tokens than the JSON dict view)."
         )
     )
     def get_subreddit_listing(
@@ -279,7 +280,10 @@ def build_server(
             "specific subtree once you've picked one. Returned comments "
             "include nested replies that came back in Reddit's response "
             "(may be partial; expand_comment() on the focal comment for "
-            "full coverage)."
+            "full coverage). format='markdown' renders post + comment "
+            "tree as depth-indented bullets with body content blockquoted "
+            "(~10x cheaper than JSON; safe against user-content spoofing "
+            "of renderer structure)."
         )
     )
     def get_thread(
@@ -302,7 +306,8 @@ def build_server(
             "thread's subreddit (no 'r/' prefix). thread_id and comment_id "
             "accept bare ids or fullnames. depth: 0-5 (0 = focal comment "
             "only). limit: 1-50. Per-call hard caps; per-session aggregate "
-            "budget also applies."
+            "budget also applies. format='markdown' for the depth-indented "
+            "bullet view (~10x cheaper than JSON)."
         )
     )
     def expand_comment(
@@ -347,7 +352,9 @@ def build_server(
             "Snapshot of cache state, transport rate-limit headroom, and "
             "session budget consumption. Call this before launching a "
             "wide search to confirm headroom; or after, to see what got "
-            "spent. Doesn't touch the network."
+            "spent. Doesn't touch the network. format='markdown' for a "
+            "human-readable bullet view; default 'json' is structured "
+            "for routing decisions."
         )
     )
     def status(format: ResultFormat = "json") -> dict:
