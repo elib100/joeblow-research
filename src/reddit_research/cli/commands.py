@@ -21,6 +21,7 @@ import json
 import sys
 from typing import Any, Callable
 
+from reddit_research._markdown import to_markdown
 from reddit_research._serialize import to_jsonable
 from reddit_research.core import (
     BudgetExceededError,
@@ -165,6 +166,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 def _emit(args: argparse.Namespace, payload: Any) -> None:
     if args.format == "json":
         print(json.dumps(to_jsonable(payload), indent=2, default=str))
+    elif args.format == "markdown":
+        print(to_markdown(payload))
     else:
         _emit_text(payload)
 

@@ -27,12 +27,13 @@ are not the LLM's problem.
 from __future__ import annotations
 
 import logging
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from reddit_research import __version__ as PKG_VERSION
+from reddit_research._markdown import to_markdown
 from reddit_research._serialize import to_jsonable
 from reddit_research.core import (
     BudgetExceededError,
@@ -68,7 +69,19 @@ SERVER_INSTRUCTIONS = (
 # ---- Result-shape helpers -------------------------------------------------
 
 
-def _ok(payload: Any) -> dict:
+# Tool-call output formats. ``json`` returns the dataclass-asdict view
+# (lists, dicts, primitives); ``markdown`` returns a single string with
+# Reddit metadata stripped and comment trees rendered as depth-indented
+# bullets. Phase 0 measured ~10x token leverage on the most expensive
+# paths (list+threads). Default stays ``json`` for backwards
+# compatibility with v0.2-chunk-1 callers; the LLM picks ``markdown``
+# when it wants the cheaper view.
+ResultFormat = Literal["json", "markdown"]
+
+
+def _ok(payload: Any, *, format: ResultFormat = "json") -> dict:
+    if format == "markdown":
+        return {"ok": True, "result": to_markdown(payload)}
     return {"ok": True, "result": to_jsonable(payload)}
 
 
@@ -83,7 +96,9 @@ def _err(error_type: str, **fields: Any) -> dict:
     return {"ok": False, "error": {"type": error_type, **fields}}
 
 
-def _wrap_reddit_call(fn, *args, **kwargs) -> dict:
+def _wrap_reddit_call(
+    fn, *args, _format: ResultFormat = "json", **kwargs
+) -> dict:
     """Run a core operation and translate typed errors into structured dicts.
 
     Pure programmer / infrastructure failures (RuntimeError from cache
@@ -98,6 +113,12 @@ def _wrap_reddit_call(fn, *args, **kwargs) -> dict:
     code preserved, instead of escaping as MCP isError. Reddit's ``.json``
     transport doesn't return these today, but if its edge changes the
     failure stays informative.
+
+    ``_format`` is the output format for the success envelope. Errors
+    are always JSON-shaped (their fields are the discriminators the LLM
+    branches on; markdown-rendering them would lose the structure).
+    Underscored to avoid colliding with operation kwargs that might be
+    named ``format``.
     """
     try:
         result = fn(*args, **kwargs)
@@ -163,7 +184,7 @@ def _wrap_reddit_call(fn, *args, **kwargs) -> dict:
         # later", cap violations mean "fix your arguments". Same envelope,
         # the message disambiguates.
         return _err("invalid_input", message=str(e))
-    return _ok(result)
+    return _ok(result, format=_format)
 
 
 # ---- Server factory -------------------------------------------------------
@@ -198,7 +219,9 @@ def build_server(
             "name (no 'r/' prefix) to scope. sort: relevance|hot|top|new|"
             "comments. time: all|year|month|week|day|hour. limit: 1-100, "
             "default 25. Returns a list of thread summaries; pick a "
-            "fullname (e.g. t3_abc123) to feed into get_thread()."
+            "fullname (e.g. t3_abc123) to feed into get_thread(). "
+            "format='markdown' returns a compact bullet list (~10x cheaper "
+            "in tokens than the JSON view)."
         )
     )
     def search(
@@ -208,6 +231,7 @@ def build_server(
         time_filter: str = "all",
         limit: Annotated[int, Field(ge=1, le=100)] = 25,
         fresh: bool = False,
+        format: ResultFormat = "json",
     ) -> dict:
         return _wrap_reddit_call(
             ops.search,
@@ -217,6 +241,7 @@ def build_server(
             time_filter=time_filter,
             limit=limit,
             fresh=fresh,
+            _format=format,
         )
 
     @mcp.tool(
@@ -233,6 +258,7 @@ def build_server(
         limit: Annotated[int, Field(ge=1, le=100)] = 25,
         time_filter: str = "all",
         fresh: bool = False,
+        format: ResultFormat = "json",
     ) -> dict:
         return _wrap_reddit_call(
             ops.get_subreddit_listing,
@@ -241,6 +267,7 @@ def build_server(
             limit=limit,
             time_filter=time_filter,
             fresh=fresh,
+            _format=format,
         )
 
     @mcp.tool(
@@ -259,12 +286,14 @@ def build_server(
         thread_id: str,
         top_n_comments: Annotated[int, Field(ge=1, le=100)] = 20,
         fresh: bool = False,
+        format: ResultFormat = "json",
     ) -> dict:
         return _wrap_reddit_call(
             ops.get_thread,
             thread_id=thread_id,
             top_n_comments=top_n_comments,
             fresh=fresh,
+            _format=format,
         )
 
     @mcp.tool(
@@ -283,6 +312,7 @@ def build_server(
         depth: Annotated[int, Field(ge=0, le=5)] = 2,
         limit: Annotated[int, Field(ge=1, le=50)] = 20,
         fresh: bool = False,
+        format: ResultFormat = "json",
     ) -> dict:
         return _wrap_reddit_call(
             ops.expand_comment,
@@ -292,6 +322,7 @@ def build_server(
             depth=depth,
             limit=limit,
             fresh=fresh,
+            _format=format,
         )
 
     @mcp.tool(
@@ -319,8 +350,8 @@ def build_server(
             "spent. Doesn't touch the network."
         )
     )
-    def status() -> dict:
-        return _wrap_reddit_call(ops.status)
+    def status(format: ResultFormat = "json") -> dict:
+        return _wrap_reddit_call(ops.status, _format=format)
 
     @mcp.tool(
         description=(

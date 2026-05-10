@@ -1374,6 +1374,308 @@ def test_mcp_purge_negative_via_core_validation():
             assert_raises(ValueError, cache.purge, older_than_seconds=-1)
 
 
+# ---- Markdown preprocessor (v0.2 chunk 2) -------------------------------
+#
+# Token-savings is the whole point of this layer (Phase 0 measured ~10x on
+# list+threads paths). Tests verify shape, identifier preservation
+# (fullnames must stay in the output so the LLM can drill in), recursive
+# depth indenting, deleted-author handling, escaping, and a coarse byte-
+# size sanity check that the markdown output is meaningfully smaller than
+# the equivalent JSON for a representative payload.
+
+
+@test
+def test_markdown_listing_shape():
+    """A list[ThreadSummary] renders as one bullet line per thread,
+    with the fullname backticked so the LLM can extract it cleanly."""
+    from reddit_research._markdown import to_markdown
+    from reddit_research.core.operations import ThreadSummary
+    items = [
+        ThreadSummary(
+            fullname="t3_abc", id="abc", subreddit="python", title="A",
+            author="alice", score=10, upvote_ratio=0.9, num_comments=5,
+            permalink="/r/python/comments/abc/a/", created_utc=0,
+            is_self=True, selftext="",
+        ),
+        ThreadSummary(
+            fullname="t3_def", id="def", subreddit="python", title="B",
+            author=None, score=3, upvote_ratio=0.5, num_comments=0,
+            permalink="/r/python/comments/def/b/", created_utc=0,
+            is_self=False, selftext="",
+        ),
+    ]
+    md = to_markdown(items)
+    lines = md.split("\n")
+    assert_eq(len(lines), 2, f"expected 2 bullet lines, got: {md!r}")
+    # First line must contain score, sub, title, fullname, comment count
+    assert_("**[10]**" in lines[0])
+    assert_("r/python" in lines[0])
+    assert_("`t3_abc`" in lines[0],
+            "fullname must be backticked so LLMs can extract it")
+    assert_("alice" in lines[0])
+    # Second line: deleted author shown as [deleted]
+    assert_("[deleted]" in lines[1])
+
+
+@test
+def test_markdown_listing_empty():
+    """Empty listing renders an italic placeholder, not just whitespace."""
+    from reddit_research._markdown import to_markdown
+    md = to_markdown([])
+    assert_("(no results)" in md)
+
+
+@test
+def test_markdown_thread_shape():
+    """A Thread renders H1 title + italic metadata + selftext + comments."""
+    from reddit_research._markdown import to_markdown
+    from reddit_research.core.operations import (
+        CommentSummary, Thread, ThreadSummary,
+    )
+    post = ThreadSummary(
+        fullname="t3_abc", id="abc", subreddit="python",
+        title="The title", author="alice", score=42, upvote_ratio=0.95,
+        num_comments=2, permalink="/r/python/comments/abc/title/",
+        created_utc=0, is_self=True, selftext="self text body",
+    )
+    c1 = CommentSummary(
+        fullname="t1_c1", id="c1", body="top comment", author="bob",
+        score=5, created_utc=0, parent_id="t3_abc", depth=0,
+        replies=(CommentSummary(
+            fullname="t1_c2", id="c2", body="reply", author="carol",
+            score=2, created_utc=0, parent_id="t1_c1", depth=1,
+            replies=(),
+        ),),
+    )
+    md = to_markdown(Thread(post=post, comments=(c1,)))
+    # H1 title (with no escaping needed here)
+    assert_("# The title" in md)
+    # Italic metadata line includes fullname
+    assert_("`t3_abc`" in md)
+    # Selftext present
+    assert_("self text body" in md)
+    # Comments section header
+    assert_("## Comments" in md)
+    # Top-level bullet at depth 0 (no leading spaces)
+    assert_("- **[5]** bob · `t1_c1`:" in md)
+    # Reply at depth 1: 2-space indent
+    assert_("  - **[2]** carol · `t1_c2`:" in md,
+            f"reply must be indented 2 spaces; output:\n{md}")
+
+
+@test
+def test_markdown_comment_tree_depth_indenting():
+    """expand_comment payload: focal + nested replies, indented 2 spaces per level."""
+    from reddit_research._markdown import to_markdown
+    from reddit_research.core.operations import CommentSummary, CommentTree
+    deep = CommentSummary(
+        fullname="t1_d", id="d", body="deepest", author="d_user", score=1,
+        created_utc=0, parent_id="t1_b", depth=2, replies=(),
+    )
+    middle = CommentSummary(
+        fullname="t1_b", id="b", body="middle", author="b_user", score=3,
+        created_utc=0, parent_id="t1_a", depth=1, replies=(deep,),
+    )
+    root = CommentSummary(
+        fullname="t1_a", id="a", body="top", author="a_user", score=5,
+        created_utc=0, parent_id="t3_x", depth=0, replies=(middle,),
+    )
+    md = to_markdown(CommentTree(root=root))
+    # depth 0: no indent
+    assert_("- **[5]** a_user · `t1_a`: top" in md)
+    # depth 1: 2-space indent
+    assert_("  - **[3]** b_user · `t1_b`: middle" in md)
+    # depth 2: 4-space indent
+    assert_("    - **[1]** d_user · `t1_d`: deepest" in md,
+            f"deepest reply must be 4-space indented; output:\n{md}")
+
+
+@test
+def test_markdown_multiline_body_continuation():
+    """Bodies with newlines should keep readable indentation in nested lists."""
+    from reddit_research._markdown import to_markdown
+    from reddit_research.core.operations import CommentSummary, CommentTree
+    c = CommentSummary(
+        fullname="t1_a", id="a", body="line one\nline two",
+        author="x", score=1, created_utc=0, parent_id="t3_y", depth=0,
+        replies=(),
+    )
+    md = to_markdown(CommentTree(root=c))
+    lines = md.split("\n")
+    # Find the bullet line; the next non-blank line must be the
+    # continuation, indented to bullet's content column (2 spaces for depth 0).
+    bullet_idx = next(i for i, L in enumerate(lines) if L.startswith("- **[1]**"))
+    cont_idx = bullet_idx + 1
+    assert_eq(lines[cont_idx], "  line two",
+              f"continuation should be indented 2 spaces; got {lines[cont_idx]!r}")
+
+
+@test
+def test_markdown_escapes_brackets_in_titles():
+    """Title escaping prevents [ ] from breaking the inline link syntax."""
+    from reddit_research._markdown import to_markdown
+    from reddit_research.core.operations import ThreadSummary
+    item = ThreadSummary(
+        fullname="t3_abc", id="abc", subreddit="python",
+        title="Has [brackets] in it", author="x", score=1,
+        upvote_ratio=0.5, num_comments=0,
+        permalink="/r/python/comments/abc/x/", created_utc=0,
+        is_self=False, selftext="",
+    )
+    md = to_markdown([item])
+    # Brackets escaped — [Title](link) syntax stays intact for the link
+    assert_("Has \\[brackets\\] in it" in md,
+            f"brackets in title must be escaped; got: {md}")
+
+
+@test
+def test_markdown_token_savings_vs_json():
+    """Sanity: markdown output should be meaningfully smaller (≥2x byte
+    reduction) than the dataclass-asdict JSON view for a realistic
+    comment-tree payload. Acts as a regression canary if a future
+    change starts bloating the markdown layer.
+
+    Note on the threshold: Phase 0 measured ~10x token leverage *against
+    raw cached Reddit JSON* (the part with ~90% operational metadata —
+    awards/mod_reports/media_metadata/etc.). This test compares against
+    the dataclass-asdict view instead, which is itself already a
+    stripped view; the savings between asdict-json and markdown are
+    structural overhead only (`{"key":"value"}` vs `key: value`), so
+    the ratio here is naturally lower. The big win still applies in
+    production where the alternative is the raw payload.
+    """
+    import json as _json
+    from reddit_research._markdown import to_markdown
+    from reddit_research._serialize import to_jsonable
+    from reddit_research.core.operations import (
+        CommentSummary, Thread, ThreadSummary,
+    )
+    # Synthetic but realistic-ish thread: 5 top-level comments with
+    # 2-3 nested replies each.
+    def make_comment(fid, body, depth, replies=()):
+        return CommentSummary(
+            fullname=f"t1_{fid}", id=fid, body=body, author=f"u_{fid}",
+            score=42, created_utc=1700000000.123456,
+            parent_id=f"t1_parent_{fid}", depth=depth, replies=replies,
+        )
+    comments = tuple(
+        make_comment(
+            f"top{i}",
+            "Lorem ipsum dolor sit amet, consectetur adipiscing elit. " * 2,
+            0,
+            replies=tuple(
+                make_comment(
+                    f"r{i}_{j}",
+                    "Reply body sed do eiusmod tempor incididunt.",
+                    1,
+                )
+                for j in range(3)
+            ),
+        )
+        for i in range(5)
+    )
+    post = ThreadSummary(
+        fullname="t3_zzz", id="zzz", subreddit="python",
+        title="Token savings demo", author="op", score=999,
+        upvote_ratio=0.95, num_comments=20,
+        permalink="/r/python/comments/zzz/demo/", created_utc=1700000000,
+        is_self=True, selftext="Original post body, multiple sentences. " * 3,
+    )
+    thread = Thread(post=post, comments=comments)
+
+    json_bytes = len(_json.dumps(to_jsonable(thread)).encode("utf-8"))
+    md_bytes = len(to_markdown(thread).encode("utf-8"))
+    ratio = json_bytes / md_bytes
+    assert_(ratio >= 2.0,
+            f"markdown should be ≥2x smaller than asdict-JSON; "
+            f"got json={json_bytes}B md={md_bytes}B ratio={ratio:.2f}x")
+
+
+@test
+def test_markdown_empty_body_renders_placeholder():
+    """A removed comment (empty body) should still get a metadata line so
+    the LLM can see it exists; otherwise summarization silently drops
+    deletions, which can mislead.
+    """
+    from reddit_research._markdown import to_markdown
+    from reddit_research.core.operations import CommentSummary, CommentTree
+    c = CommentSummary(
+        fullname="t1_a", id="a", body="", author=None, score=0,
+        created_utc=0, parent_id="t3_x", depth=0, replies=(),
+    )
+    md = to_markdown(CommentTree(root=c))
+    assert_("[deleted]" in md)
+    assert_("(empty)" in md or "_(empty)_" in md)
+
+
+@test
+def test_mcp_search_format_markdown():
+    """End-to-end: MCP search tool with format='markdown' returns a string."""
+    def handler(req):
+        return _listing_response([_MIN_POST])
+    with tempfile.TemporaryDirectory() as td:
+        server, ops, _ = _build_mcp_server(handler, td)
+        try:
+            out = _call_mcp_tool(
+                server, "search",
+                query="foo", subreddit="python", format="markdown",
+            )
+            assert_eq(out["ok"], True)
+            assert_(isinstance(out["result"], str),
+                    f"markdown result must be a string, got {type(out['result']).__name__}")
+            assert_("**[5]**" in out["result"],
+                    f"score must appear in markdown; got: {out['result']!r}")
+            assert_("`t3_abc`" in out["result"],
+                    "fullname must be backticked in markdown")
+        finally:
+            ops.close()
+
+
+@test
+def test_mcp_get_thread_format_markdown_default_still_json():
+    """format defaults to 'json' so existing v0.2-chunk-1 callers keep
+    getting the dict view they already rely on."""
+    def handler(req):
+        return _thread_response(
+            _MIN_POST,
+            [{"id": "c1", "body": "hi", "author": "a", "score": 3,
+              "created_utc": 0, "parent_id": "t3_abc"}],
+        )
+    with tempfile.TemporaryDirectory() as td:
+        server, ops, _ = _build_mcp_server(handler, td)
+        try:
+            # No format kwarg → JSON shape
+            out = _call_mcp_tool(server, "get_thread", thread_id="abc")
+            assert_eq(out["ok"], True)
+            assert_(isinstance(out["result"], dict),
+                    "default format must remain json (dict)")
+            assert_("post" in out["result"])
+        finally:
+            ops.close()
+
+
+@test
+def test_mcp_error_envelope_unaffected_by_format():
+    """Errors are always JSON-shaped — markdown-rendering them would lose
+    the discriminator fields the LLM branches on. Verify a 404 with
+    format='markdown' still returns a structured error envelope, not a
+    markdown blob."""
+    def handler(req):
+        return httpx.Response(404, json={"message": "Not Found", "error": 404})
+    with tempfile.TemporaryDirectory() as td:
+        server, ops, _ = _build_mcp_server(handler, td)
+        try:
+            out = _call_mcp_tool(
+                server, "get_thread",
+                thread_id="zzzzzz", format="markdown",
+            )
+            assert_eq(out["ok"], False)
+            assert_eq(out["error"]["type"], "not_found")
+            assert_("path" in out["error"])
+        finally:
+            ops.close()
+
+
 @test
 def test_mcp_budget_reset_helper_directly():
     """Round-9-equivalent: WorkflowBudget.reset() is a one-call zeroing.

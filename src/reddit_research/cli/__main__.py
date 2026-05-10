@@ -50,8 +50,14 @@ def build_parser() -> argparse.ArgumentParser:
         description="Personal Reddit research tool — search, listings, threads, comments.",
     )
     p.add_argument(
-        "--format", choices=["text", "json"], default="text",
-        help="Output format. JSON uses dataclasses.asdict serialization.",
+        "--format", choices=["text", "json", "markdown"], default="text",
+        help=(
+            "Output format. `text` is human-friendly; `json` uses "
+            "dataclasses.asdict serialization; `markdown` strips Reddit "
+            "metadata and renders comment trees as depth-indented bullets "
+            "for LLM consumption (~10x token savings on the most expensive "
+            "paths)."
+        ),
     )
     p.add_argument(
         "--budget-api", type=_positive_int, default=50,
